@@ -21,10 +21,7 @@ from-scratch C++ client.
 - [The SUMO / TraCI Integration](#the-sumo--traci-integration)
 - [Experimental Setup](#experimental-setup)
 - [Results](#results)
-<<<<<<< HEAD
 - [A Logging Bug Worth Documenting](#a-logging-bug-worth-documenting)
-=======
->>>>>>> 6d9d9768adb1a3286f05aa3ed436380abd77adeb
 - [Discussion & Limitations](#discussion--limitations)
 - [Repository Structure](#repository-structure)
 - [Building & Running](#building--running)
@@ -34,37 +31,22 @@ from-scratch C++ client.
 
 ## Problem Statement
 
-<<<<<<< HEAD
 Vehicles in an IoV network generate compute tasks — often structured as
-=======
-Vehicles in an IoV network generate compute tasks -often structured as
->>>>>>> 6d9d9768adb1a3286f05aa3ed436380abd77adeb
 **DAGs** (directed acyclic graphs) of sub-tasks with data dependencies,
 e.g. a perception pipeline: `sense → preprocess → {detect, segment} →
 fuse → decide`. Each vehicle can execute tasks locally or **offload**
 them to one of several roadside edge servers. Two decisions compound:
 
-<<<<<<< HEAD
 1. **Scheduling** — given several ready sub-tasks, which order should
    they be dispatched in? (naive FIFO vs. critical-path-aware ordering)
 2. **Offloading** — for a given task, which edge server should receive
-=======
-1. **Scheduling** -given several ready sub-tasks, which order should
-   they be dispatched in? (naive FIFO vs. critical-path-aware ordering)
-2. **Offloading** -for a given task, which edge server should receive
->>>>>>> 6d9d9768adb1a3286f05aa3ed436380abd77adeb
    it? A server might be geographically closer (lower link latency) but
    already congested (long queue), or farther but idle.
 
 The complication that makes this specifically an *IoV* problem rather
 than a generic scheduling problem: **link latency is not static.**
-<<<<<<< HEAD
 Vehicles move, so vehicle-to-server proximity — and therefore link
 quality — changes every simulation tick. A policy that looks optimal
-=======
-Vehicles move, so vehicle-to-server proximity -and therefore link
-quality -changes every simulation tick. A policy that looks optimal
->>>>>>> 6d9d9768adb1a3286f05aa3ed436380abd77adeb
 against a snapshot of network conditions can be wrong a few seconds
 later. This project evaluates scheduling/offloading policies under that
 actual dynamic, using SUMO to generate the mobility rather than
@@ -120,13 +102,8 @@ touching anything else.
 | `src/offloading/` | `IOffloadingPolicy` | `GreedyLatencyLoadPolicy` (load + latency, weighted) · `NearestServerPolicy` (latency-only baseline) |
 | `src/resource_mgmt/` | `IResourceAllocator` | `FifoResourceAllocator` (per-server FIFO queues, heterogeneous CPU capacity) |
 
-<<<<<<< HEAD
 **`HeftLiteScheduler`** computes each task's *upward rank* — its own
 workload plus the maximum rank among its dependents — once per DAG, then
-=======
-**`HeftLiteScheduler`** computes each task's *upward rank* -its own
-workload plus the maximum rank among its dependents -once per DAG, then
->>>>>>> 6d9d9768adb1a3286f05aa3ed436380abd77adeb
 dispatches ready tasks highest-rank-first. This is a simplified HEFT
 (Heterogeneous Earliest Finish Time) rule: tasks on the longest
 remaining dependency chain get priority, since delaying them delays
@@ -134,11 +111,7 @@ everything downstream.
 
 **`GreedyLatencyLoadPolicy`** scores each candidate server as
 `(queue_length / cpu_capacity) + latency_weight * link_latency_ms` and
-<<<<<<< HEAD
 picks the minimum — jointly considering congestion and proximity rather
-=======
-picks the minimum -jointly considering congestion and proximity rather
->>>>>>> 6d9d9768adb1a3286f05aa3ed436380abd77adeb
 than either alone.
 
 ## The SUMO / TraCI Integration
@@ -150,11 +123,7 @@ mode is instructive.
 ### Why TraCI-over-socket, not libsumo
 
 The original plan (see module status history) was to link **libsumo**,
-<<<<<<< HEAD
 SUMO's in-process C++ API — faster than a socket round trip, no separate
-=======
-SUMO's in-process C++ API -faster than a socket round trip, no separate
->>>>>>> 6d9d9768adb1a3286f05aa3ed436380abd77adeb
 process to manage. In practice, linking libsumo's C++ library turned out
 to require either building SUMO from source with `--enable-libsumo` or
 locating prebuilt dev binaries for the target toolchain (MSYS2 UCRT64);
@@ -191,11 +160,7 @@ The short version:
 - **Message framing:** `[4-byte big-endian length, including itself][body]`
 - **Command framing:** `[1-byte length, including itself][cmdId][payload]`,
   falling back to an extended `0x00 + 4-byte length` form once a
-<<<<<<< HEAD
   sub-command would exceed 255 bytes (this matters in practice — a
-=======
-  sub-command would exceed 255 bytes (this matters in practice -a
->>>>>>> 6d9d9768adb1a3286f05aa3ed436380abd77adeb
   vehicle-id-list response with 70+ vehicles exceeds it)
 - **Every command gets a status reply:** `[len][cmdId][resultCode][errorString]`
 - **GET commands additionally get an answer:**
@@ -203,32 +168,20 @@ The short version:
 
 `traci_client.h` implements exactly this subset (`CMD_SIMSTEP`,
 `CMD_GET_VEHICLE_VARIABLE` for position/speed/id-list, `CMD_CLOSE`) as a
-<<<<<<< HEAD
 portable class — `#ifdef _WIN32` switches between Winsock and POSIX
-=======
-portable class -`#ifdef _WIN32` switches between Winsock and POSIX
->>>>>>> 6d9d9768adb1a3286f05aa3ed436380abd77adeb
 sockets, everything else is identical on both platforms.
 
 ### One more real bug, for the record
 
 The runner script (`run_experiment.py`) originally probed the TraCI port
-<<<<<<< HEAD
 for readiness before launching the C++ driver — a normal-looking
-=======
-for readiness before launching the C++ driver -a normal-looking
->>>>>>> 6d9d9768adb1a3286f05aa3ed436380abd77adeb
 "wait until the server is listening" pattern. It caused every run to
 fail on the *first* connection attempt, with SUMO closing the socket.
 Root cause: SUMO's TraCI server accepts **exactly one** client
 connection; the readiness probe's own `connect()` consumed that slot,
 so the real client's connection attempt found nothing listening. Fixed
 by removing the probe entirely and relying on `TraciClient::connect`'s
-<<<<<<< HEAD
 own internal retry loop — the correct fix, in retrospect, since it also
-=======
-own internal retry loop -the correct fix, in retrospect, since it also
->>>>>>> 6d9d9768adb1a3286f05aa3ed436380abd77adeb
 removes a race condition the probe had.
 
 ## Experimental Setup
@@ -240,7 +193,6 @@ removes a race condition the probe had.
 and routed with `duarouter`, departing over a 0–200 s window. A
 standalone verification run (`sumo_scenario/tripinfo_test.xml`) confirms
 117 of 200 trips complete within that window with the default vehicle
-<<<<<<< HEAD
 type — i.e. this is a real, congestion-capable traffic scenario, not a
 handful of vehicles driving in circles.
 
@@ -253,31 +205,13 @@ documented analytic model (fixed processing/propagation overhead + a
 distance-scaled term) applied on top of *real* SUMO vehicle positions.
 This is standard practice in vehicular-edge literature (real mobility +
 analytic channel model) — it is explicitly not a full radio/backhaul
-=======
-type -i.e. this is a real, congestion-capable traffic scenario, not a
-handful of vehicles driving in circles.
-
-**Edge servers:** 2 heterogeneous servers placed at opposite corners of
-the grid -`server 100` at `(100, 100)`, capacity 1.0, `server 101` at
-`(500, 500)`, capacity 2.5 (faster).
-
-**Latency model:** `estimateLatencyMs = 2.0 + 0.05 × distance_m` -a
-documented analytic model (fixed processing/propagation overhead + a
-distance-scaled term) applied on top of *real* SUMO vehicle positions.
-This is standard practice in vehicular-edge literature (real mobility +
-analytic channel model) -it is explicitly not a full radio/backhaul
->>>>>>> 6d9d9768adb1a3286f05aa3ed436380abd77adeb
 simulator, and this README says so rather than implying otherwise.
 
 **Workload:** rather than one fixed DAG, `main.cpp` continuously spawns
 random fork-join DAGs (3–6 tasks, 1–2 dependencies per non-root task,
 workload ~U(20,80)) as a Poisson-ish arrival process (mean 1.2 DAGs/s),
 each "owned" by a randomly chosen vehicle currently present in the
-<<<<<<< HEAD
 simulation — that vehicle's real-time position drives the link-latency
-=======
-simulation -that vehicle's real-time position drives the link-latency
->>>>>>> 6d9d9768adb1a3286f05aa3ed436380abd77adeb
 term for all of that DAG's offloading decisions.
 
 **Configurations compared:** the 2×2 factorial of
@@ -295,7 +229,6 @@ This is the load-bearing plot for the claim "this is a real SUMO
 integration." Top panel: vehicle count in the simulation ramps from 0 to
 a peak of **79** as SUMO's route file departs vehicles over time, then
 plateaus and fluctuates as vehicles arrive at their destinations and
-<<<<<<< HEAD
 leave the network — this shape is a direct readout of SUMO's own
 routing, not something the C++ code invented. Middle panel: **ambient**
 link latency — the mean latency from every vehicle currently in the
@@ -311,15 +244,6 @@ dispatch time — see the note in `main.cpp` (`decision_state`) and the
 numbers are deliberately kept separate. Bottom panel: server queue depth occasionally
 spikes to 2–3 tasks as arrivals briefly outpace one server's service
 rate, then drains — visible, if modest, congestion dynamics.
-=======
-leave the network -this shape is a direct readout of SUMO's own
-routing, not something the C++ code invented. Middle panel: link latency
-to both edge servers fluctuates between **6.8 ms and 36.1 ms** as the
-DAG-owning vehicle moves around the grid -a static mobility model would
-produce a flat line here. Bottom panel: server queue depth occasionally
-spikes to 2–3 tasks as arrivals briefly outpace one server's service
-rate, then drains -visible, if modest, congestion dynamics.
->>>>>>> 6d9d9768adb1a3286f05aa3ed436380abd77adeb
 
 ### Offloading policy comparison
 
@@ -346,11 +270,7 @@ farther-but-idle server once the near one is congested.
 
 The full distribution (not just the mean) confirms `greedy`
 (green/blue) dominates `nearest` (red/orange) at essentially every
-<<<<<<< HEAD
 percentile, not merely on average — the improvement isn't a few outliers
-=======
-percentile, not merely on average -the improvement isn't a few outliers
->>>>>>> 6d9d9768adb1a3286f05aa3ed436380abd77adeb
 skewing the mean.
 
 ![Throughput over time](results/plots/throughput_over_time.png)
@@ -358,11 +278,7 @@ skewing the mean.
 All four configurations complete essentially the same cumulative task
 count over time. This is expected, not a null result: at this arrival
 rate (1.2 DAGs/s) against 2 edge servers with combined capacity 3.5×,
-<<<<<<< HEAD
 the system is **latency-bound, not throughput-bound** — every dispatched
-=======
-the system is **latency-bound, not throughput-bound** -every dispatched
->>>>>>> 6d9d9768adb1a3286f05aa3ed436380abd77adeb
 task eventually completes regardless of policy, so the policies
 differentiate on *how long tasks wait*, not *whether* they finish. See
 [Discussion](#discussion--limitations) for what would surface a
@@ -373,11 +289,7 @@ throughput difference.
 Link latency plotted against network-wide mean vehicle speed, across all
 runs. The scatter shows real variance driven by actual vehicle
 positions (this data could not exist without a genuine mobility
-<<<<<<< HEAD
 simulation feeding it) but no strong global correlation — expected,
-=======
-simulation feeding it) but no strong global correlation -expected,
->>>>>>> 6d9d9768adb1a3286f05aa3ed436380abd77adeb
 since a single DAG's latency depends on *its own* owner vehicle's
 distance to each server, not the network's average speed. Included for
 transparency rather than to claim a trend that isn't there.
