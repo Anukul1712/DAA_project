@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- sumo-gui view used by `run_experiment.py --gui`. -->
+<viewsettings>
+    <scheme name="real world"/>
+    <viewport zoom="100" x="300" y="300"/>
+    <delay value="50"/>
+</viewsettings>

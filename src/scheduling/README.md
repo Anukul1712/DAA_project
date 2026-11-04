@@ -1,41 +1,35 @@
-# DAG Task Modeling & Scheduling Core
+# Scheduling (task order)
 
-**Owner:** Member 1
+Decides **in which order waiting tasks are dispatched**. All tasks whose
+dependencies are finished, from all DAGs, sit in one waiting list; each tick
+the scheduler sorts that list and the driver offers tasks to servers in that
+order.
 
-## What this module owns
+| File | What it is |
+|---|---|
+| `task_scheduler.h` | `Task`, `Dag`, `ReadyTask` types and the `ITaskScheduler` interface |
+| `heft_lite_scheduler.h` | **HEFT-lite**: highest *upward rank* first (the prioritisation phase of HEFT) |
+| `fifo_scheduler.h` | **FIFO** baseline: the task that became ready first goes first |
+| `dag_generator.h` | Random DAG generator (synthetic workload) |
+| `workload.h` | `IDagSource`: synthetic DAGs, or real workflow DAGs read from `data/wfcommons_dags.csv` |
 
-- Representing an application as a DAG of tasks (nodes = tasks, edges =
-  data/precedence dependencies)
-- Tracking which tasks are "ready" (all predecessors completed)
-- Producing an execution order / priority for ready tasks, under a
-  swappable scheduling policy (e.g. HEFT-style rank, earliest-deadline,
-  greedy critical-path)
+**Upward rank** of a task = its mean execution time + mean upload time + the
+largest rank among its children. It estimates how long the rest of the DAG
+takes from this task onwards, so the highest rank is on the critical path.
+"Lite" because only HEFT's ordering phase is implemented; picking the server
+is the offloading policy's job (`eft` there is the closest to HEFT's
+server-selection phase).
 
-## Interface contract
+**When does the order matter?** Mostly when tasks have to wait for a
+server. With unlimited admission every waiting task is dispatched in the same
+tick, and the order only sets queue positions; HEFT-lite is then slightly
+faster than FIFO (about 0.3–1%). With an admission limit (`--server-slots K`)
+tasks queue centrally and the order decides who goes first. Under heavy load
+HEFT-lite is then clearly *worse*, because new DAGs keep jumping ahead of
+older ones. See the main README for the numbers.
 
-`ITaskScheduler` (see `task_scheduler.h`) is the Strategy interface every
-scheduling policy implements. `offloading/` and `resource_mgmt/` only ever
-talk to this interface — never to a concrete policy — so policies can be
-swapped for experiments without touching the rest of the pipeline.
+**Random DAGs** (`dag_generator.h`): 3–6 tasks; every task after the first
+depends on 1–2 earlier tasks (so the graph is acyclic and topologically
+ordered); workload U(100, 500) Mcycles; input data U(50, 400) KB.
 
-```
-DAGModel  --ready tasks-->  ITaskScheduler  --ordered tasks-->  (Offloading Engine)
-```
-
-## Status
-
-- [x] DAG data structure implemented (`Task` in `task_scheduler.h`)
-- [x] Dependency resolution / ready-queue logic implemented (in `main.cpp`'s
-      drive loop for now — will move into this module as it grows)
-- [x] Concrete policy implemented: `HeftLiteScheduler` (`heft_lite_scheduler.h`)
-      — upward-rank priority, a simplified HEFT rule
-- [ ] Unit tests for a small hand-built DAG
-- [ ] Second policy to compare against (e.g. plain FIFO)
-
-## What to present at mid-eval
-
-- The `Task` struct and the sample 5-task fork-join DAG in `main.cpp`
-- `HeftLiteScheduler`: rank(task) = workload + max(rank(child)), so tasks
-  on the longest remaining dependency chain get priority
-- How `ITaskScheduler` keeps this swappable — `main.cpp` only calls the
-  interface, never `HeftLiteScheduler` directly
+Tests: `tests/run_tests.cpp` (rank values, ordering, generator validity).

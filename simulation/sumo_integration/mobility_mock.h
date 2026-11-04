@@ -1,61 +1,53 @@
 #pragma once
 #include <cmath>
+#include <string>
 #include "mobility_provider.h"
 
 namespace iov::simulation {
 
-// PLACEHOLDER for the real SumoBridge. Generates a handful of vehicles
-// moving in simple circular paths so the rest of the pipeline (which
-// only depends on IMobilityProvider) can be built, run, and demoed
-// before the real libsumo integration lands.
-//
-// Swap-out plan: SumoBridge (sumo_bridge.h) implements the same
-// interface using libsumo::vehicle::getPosition() etc. Once that's
-// wired up, main.cpp changes one line to construct SumoBridge instead
-// of MockMobilityProvider — nothing else in the pipeline changes.
+// Synthetic mobility for quick runs without SUMO (--mock). Vehicles drive
+// around a circle centred on the 600 m x 600 m grid at a constant
+// speed. Positions advance by speed * step_length each step(), so the
+// reported speed matches the actual motion.
 class MockMobilityProvider : public IMobilityProvider {
 public:
-    explicit MockMobilityProvider(int num_vehicles, double area_size = 1000.0)
-        : area_size_(area_size) {
+    MockMobilityProvider(int num_vehicles, double step_length_s, double area_size_m = 600.0,
+                         double speed_mps = 12.0)
+        : dt_(step_length_s), center_(area_size_m / 2.0), radius_(area_size_m * 0.35),
+          speed_(speed_mps) {
         for (int i = 0; i < num_vehicles; ++i) {
-            vehicles_.push_back({"veh_" + std::to_string(i), 0.0, 0.0, 12.0});
-            phase_.push_back(i * 0.9);
+            std::string id = "mock_" + std::to_string(i);
+            phase_[id] = 2.0 * kPi * i / num_vehicles;
+            vehicles_[id] = {id, 0.0, 0.0, speed_};
         }
+        place();
     }
 
     void step() override {
-        t_ += 1.0;
-        for (size_t i = 0; i < vehicles_.size(); ++i) {
-            double radius = area_size_ * 0.35;
-            vehicles_[i].x = area_size_ / 2 + radius * std::cos(0.05 * t_ + phase_[i]);
-            vehicles_[i].y = area_size_ / 2 + radius * std::sin(0.05 * t_ + phase_[i]);
-        }
+        t_ += dt_;
+        place();
     }
 
-    std::unordered_map<std::string, VehiclePose> vehiclePositions() const override {
-        std::unordered_map<std::string, VehiclePose> out;
-        for (const auto& v : vehicles_) out[v.vehicle_id] = v;
-        return out;
-    }
-
-    double estimateLatencyMs(const std::string& vehicle_id,
-                              double server_x, double server_y) const override {
-        for (const auto& v : vehicles_) {
-            if (v.vehicle_id == vehicle_id) {
-                double dx = v.x - server_x, dy = v.y - server_y;
-                double dist = std::sqrt(dx * dx + dy * dy);
-                // placeholder propagation model: base + distance-scaled term
-                return 2.0 + dist * 0.05;
-            }
-        }
-        return 1e9;  // vehicle not found -> effectively unreachable
+    const std::unordered_map<std::string, VehiclePose>& vehicles() const override {
+        return vehicles_;
     }
 
 private:
-    std::vector<VehiclePose> vehicles_;
-    std::vector<double> phase_;
-    double area_size_;
+    static constexpr double kPi = 3.14159265358979323846;
+
+    void place() {
+        double angle_now = speed_ * t_ / radius_;  // arc length / radius
+        for (auto& [id, v] : vehicles_) {
+            double a = angle_now + phase_[id];
+            v.x = center_ + radius_ * std::cos(a);
+            v.y = center_ + radius_ * std::sin(a);
+        }
+    }
+
+    double dt_, center_, radius_, speed_;
     double t_ = 0.0;
+    std::unordered_map<std::string, double> phase_;
+    std::unordered_map<std::string, VehiclePose> vehicles_;
 };
 
 }  // namespace iov::simulation

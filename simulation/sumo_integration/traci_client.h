@@ -3,7 +3,7 @@
 // socket. No libsumo, no Python — just the documented wire protocol,
 // implemented against what SUMO 1.27.1 actually sends on the wire
 // (verified byte-for-byte against the official Python client; see
-// docs/TRACI_PROTOCOL_NOTES.md for the worked-out decode).
+// simulation/sumo_integration/TRACI_PROTOCOL_NOTES.md for the decode).
 //
 // This only talks to an *already-running* `sumo` process that was
 // started with `--remote-port <port>`. Launching that process is
@@ -17,6 +17,8 @@
 //       ID_LIST       (0x00) -> list of vehicle ids currently in the sim
 //       VAR_POSITION  (0x42) -> (x, y) in network coordinates
 //       VAR_SPEED     (0x40) -> speed in m/s
+//   - CMD_SET_VEHICLE_VARIABLE (0xc4):
+//       VAR_COLOR     (0x45) -> recolour a vehicle (used for the sumo-gui view)
 //   - CMD_CLOSE             (0x7f) clean shutdown
 //
 // Message framing:
@@ -42,16 +44,31 @@
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#ifdef _MSC_VER
 #pragma comment(lib, "ws2_32.lib")
+#endif
 #else
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
+#include <cerrno>
 #include <unistd.h>
 #include <time.h>
 #endif
 
 namespace iov::simulation {
+
+#ifdef _WIN32
+using socket_t = SOCKET;
+constexpr socket_t kInvalidSocket = INVALID_SOCKET;
+inline int lastSocketError() { return WSAGetLastError(); }
+#else
+using socket_t = int;
+constexpr socket_t kInvalidSocket = -1;
+inline int lastSocketError() { return errno; }
+#endif
 
 // --- TraCI wire constants (from SUMO's traci/constants.py) ---
 namespace traci_const {
@@ -59,15 +76,18 @@ constexpr uint8_t CMD_GETVERSION = 0x00;
 constexpr uint8_t CMD_SIMSTEP = 0x02;
 constexpr uint8_t CMD_CLOSE = 0x7f;
 constexpr uint8_t CMD_GET_VEHICLE_VARIABLE = 0xa4;
+constexpr uint8_t CMD_SET_VEHICLE_VARIABLE = 0xc4;
 
 constexpr uint8_t TRACI_ID_LIST = 0x00;
 constexpr uint8_t VAR_SPEED = 0x40;
 constexpr uint8_t VAR_POSITION = 0x42;
+constexpr uint8_t VAR_COLOR = 0x45;
 
 constexpr uint8_t POSITION_2D = 0x01;
 constexpr uint8_t TYPE_DOUBLE = 0x0B;
 constexpr uint8_t TYPE_STRING = 0x0C;
 constexpr uint8_t TYPE_STRINGLIST = 0x0E;
+constexpr uint8_t TYPE_COLOR = 0x11;
 }  // namespace traci_const
 
 class TraciClientError : public std::runtime_error {
@@ -104,13 +124,15 @@ public:
     // sub-command would be >= 255 bytes.
     void putCommand(uint8_t cmd_id, const std::string& payload) {
         size_t total = 1 /*len byte*/ + 1 /*cmd*/ + payload.size();
-        if (total < 255) {
+        if (total <= 255) {
             putU8(static_cast<uint8_t>(total));
             putU8(cmd_id);
             bytes_.append(payload);
         } else {
+            // Extended form: [0x00][4-byte length][cmdId][payload]; the
+            // length counts all of it: 1 + 4 + 1 + payload.
             putU8(0);
-            putU32(static_cast<uint32_t>(5 /*0x00 + 4-byte len + cmd*/ + payload.size()));
+            putU32(static_cast<uint32_t>(6 + payload.size()));
             putU8(cmd_id);
             bytes_.append(payload);
         }
@@ -218,24 +240,34 @@ public:
         int rc = getaddrinfo(host.c_str(), port_str.c_str(), &hints, &res);
         if (rc != 0) throw TraciClientError("getaddrinfo failed for " + host);
 
-        int last_errno = 0;
+        int last_error = 0;
         for (int attempt = 0; attempt < max_retries; ++attempt) {
-            sock_ = static_cast<int>(socket(res->ai_family, res->ai_socktype, res->ai_protocol));
-            if (sock_ < 0) { last_errno = 1; sleepMs(retry_delay_ms); continue; }
-
+            sock_ = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+            if (sock_ == kInvalidSocket) {
+                last_error = lastSocketError();
+                sleepMs(retry_delay_ms);
+                continue;
+            }
             if (::connect(sock_, res->ai_addr, static_cast<int>(res->ai_addrlen)) == 0) {
                 freeaddrinfo(res);
+                // Send small request messages immediately (no Nagle delay),
+                // like the official Python client does. Without this, each
+                // round trip to sumo-gui can stall for ~200 ms.
+                int one = 1;
+                setsockopt(sock_, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&one),
+                           sizeof(one));
                 connected_ = true;
                 return;
             }
+            last_error = lastSocketError();
             closeSocket(sock_);
-            sock_ = -1;
+            sock_ = kInvalidSocket;
             sleepMs(retry_delay_ms);
         }
         freeaddrinfo(res);
         throw TraciClientError("Could not connect to SUMO TraCI server at " + host + ":" +
-                                port_str + " after retrying (last_errno=" +
-                                std::to_string(last_errno) + ")");
+                                port_str + " after " + std::to_string(max_retries) +
+                                " attempts (last socket error " + std::to_string(last_error) + ")");
     }
 
     void close() {
@@ -249,9 +281,9 @@ public:
                 // best-effort close
             }
         }
-        if (sock_ >= 0) {
+        if (sock_ != kInvalidSocket) {
             closeSocket(sock_);
-            sock_ = -1;
+            sock_ = kInvalidSocket;
         }
         connected_ = false;
 #ifdef _WIN32
@@ -264,7 +296,6 @@ public:
     // use subscriptions — every GET is a fresh polled command).
     void simulationStep() {
         TraciBuffer msg;
-        std::string payload;
         TraciBuffer time_payload;
         time_payload.putF64(0.0);  // 0.0 == "advance exactly one step"
         msg.putCommand(traci_const::CMD_SIMSTEP, time_payload.data());
@@ -298,6 +329,23 @@ public:
         } catch (const TraciClientError&) {
             return false;
         }
+    }
+
+    // Recolours one vehicle (visible in sumo-gui). Throws on TraCI error.
+    void setVehicleColor(const std::string& veh_id, uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+        TraciBuffer payload;
+        payload.putU8(traci_const::VAR_COLOR);
+        payload.putStr(veh_id);
+        payload.putU8(traci_const::TYPE_COLOR);
+        payload.putU8(r);
+        payload.putU8(g);
+        payload.putU8(b);
+        payload.putU8(a);
+        TraciBuffer msg;
+        msg.putCommand(traci_const::CMD_SET_VEHICLE_VARIABLE, payload.data());
+        std::string resp = sendAndRecv(msg.data());
+        TraciReader r_(resp);
+        readStatus(r_, traci_const::CMD_SET_VEHICLE_VARIABLE);
     }
 
     // Batched fetch: one round trip fetches position+speed for every
@@ -414,7 +462,7 @@ private:
     }
 
     void sendMessage(const std::string& body) {
-        if (sock_ < 0) throw TraciClientError("sendMessage on closed socket");
+        if (sock_ == kInvalidSocket) throw TraciClientError("sendMessage on closed socket");
         TraciBuffer framed;
         framed.putU32(static_cast<uint32_t>(body.size() + 4));
         std::string full = framed.data() + body;
@@ -460,7 +508,7 @@ private:
         return out;
     }
 
-    static void closeSocket(int s) {
+    static void closeSocket(socket_t s) {
 #ifdef _WIN32
         closesocket(s);
 #else
@@ -479,7 +527,7 @@ private:
 #endif
     }
 
-    int sock_ = -1;
+    socket_t sock_ = kInvalidSocket;
     bool connected_ = false;
 #ifdef _WIN32
     bool wsa_started_ = false;

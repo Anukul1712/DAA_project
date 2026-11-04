@@ -1,14 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- 4x4 grid (200 m blocks, 600 m x 600 m), 500 random trips departing
+     1 per second over 0-500 s. The experiment driver controls the clock
+     over TraCI, so no end time is set here. -->
 <configuration>
     <input>
         <net-file value="grid.net.xml"/>
         <route-files value="routes.rou.xml"/>
+        <additional-files value="servers.add.xml"/>
     </input>
     <time>
-        <begin value="0"/>
-        <end value="200"/>
+        <step-length value="0.1"/>
     </time>
     <processing>
         <time-to-teleport value="-1"/>
-        <no-step-log value="true"/>
     </processing>
+    <report>
+        <no-step-log value="true"/>
+        <no-warnings value="true"/>
+    </report>
+    <random_number>
+        <seed value="42"/>
+    </random_number>
 </configuration>

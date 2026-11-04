@@ -1,148 +1,256 @@
 #!/usr/bin/env python3
-"""Runs the IoV edge-scheduling experiment against real SUMO.
+"""Run the IoV edge-scheduling simulator against SUMO.
 
-Launching SUMO and launching the C++ experiment_driver are kept in this
-one script deliberately, so the C++ side (traci_client.h / sumo_bridge)
-never has to spawn or manage a child process itself -- it only ever
-connects to a TraCI port that's already listening. That keeps the C++
-side identical on Windows and Linux.
+This script starts SUMO (or sumo-gui) on a free TCP port, runs the C++
+simulator (build/iov_sim) connected to it, and shuts SUMO down afterwards.
 
-Usage:
-    python3 run_experiment.py --scenario sumo_scenario/grid.sumocfg \
-        --scheduler heft --offloading greedy --duration 200 --seed 1
+Examples
+--------
+  # one run, headless
+  python run_experiment.py --offloading eft --load 0.6
 
-    # Or run the full comparison sweep used for the report plots:
-    python3 run_experiment.py --sweep
+  # real workflow DAGs (run `python data/prepare_wfcommons.py` once first)
+  python run_experiment.py --workload wfcommons
+
+  # the ML policy (uses ml/offload_mlp.txt)
+  python run_experiment.py --offloading ml
+
+  # watch it in the SUMO GUI (vehicles are coloured by the server they use)
+  python run_experiment.py --gui
+
+  # no SUMO at all (synthetic vehicles)
+  python run_experiment.py --mock
+
+  # every experiment in the README
+  python run_experiment.py --sweep
 """
 import argparse
+import csv
 import itertools
 import os
 import platform
+import shutil
 import socket
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+IS_WINDOWS = platform.system() == "Windows"
+EXE = ".exe" if IS_WINDOWS else ""
+
+SCHEDULERS = ["heft", "fifo"]
+POLICIES = ["eft", "least_loaded", "nearest", "ml"]
+WORKLOADS = ["synthetic", "wfcommons"]
+DAG_FILE = os.path.join(REPO_ROOT, "data", "wfcommons_dags.csv")
+ML_MODEL = os.path.join(REPO_ROOT, "ml", "offload_mlp.txt")
 
 
-def find_free_port() -> int:
+# ------------------------------------------------------------------ discovery
+
+def find_driver(explicit=None):
+    candidates = [explicit] if explicit else [
+        os.path.join(REPO_ROOT, "build", "iov_sim" + EXE),
+        os.path.join(REPO_ROOT, "build", "Release", "iov_sim" + EXE),  # Visual Studio
+        os.path.join(REPO_ROOT, "iov_sim" + EXE),
+    ]
+    for c in candidates:
+        for path in (c, c + EXE):
+            if path and os.path.isfile(path):
+                return path
+    sys.exit("Could not find the iov_sim executable. Build it first:\n"
+             "    cmake -S . -B build && cmake --build build\n"
+             "or pass --driver-bin PATH.")
+
+
+def find_sumo(gui=False):
+    name = ("sumo-gui" if gui else "sumo") + EXE
+    places = []
+    if os.environ.get("SUMO_HOME"):
+        places.append(os.path.join(os.environ["SUMO_HOME"], "bin", name))
+    try:  # installed with `pip install eclipse-sumo`
+        import sumo as sumo_pkg
+        places.append(os.path.join(os.path.dirname(sumo_pkg.__file__), "bin", name))
+    except ImportError:
+        pass
+    for p in places:
+        if os.path.isfile(p):
+            return p
+    on_path = shutil.which(name)
+    if on_path:
+        return on_path
+    sys.exit(f"Could not find '{name}'. Install SUMO with:\n"
+             f"    {os.path.basename(sys.executable)} -m pip install eclipse-sumo\n"
+             "(using the same Python you run this script with), or set SUMO_HOME.")
+
+
+def check_inputs(workloads, policies):
+    if "wfcommons" in workloads and not os.path.exists(DAG_FILE):
+        sys.exit("The wfcommons workload needs data/wfcommons_dags.csv. Create it with:\n"
+                 "    python data/prepare_wfcommons.py")
+    if "ml" in policies and not os.path.exists(ML_MODEL):
+        sys.exit("The ml policy needs ml/offload_mlp.txt. Train it with:\n"
+                 "    python ml/train_offload_model.py")
+
+
+def free_port():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
 
 
-def find_sumo_binary() -> str:
-    # Prefer SUMO_HOME if set (matches the project's existing setup notes).
-    sumo_home = os.environ.get("SUMO_HOME")
-    if sumo_home:
-        candidate = os.path.join(sumo_home, "bin", "sumo.exe" if platform.system() == "Windows" else "sumo")
-        if os.path.exists(candidate):
-            return candidate
-    # Fall back to the `sumo` package installed via `pip install eclipse-sumo`.
-    try:
-        import sumo as sumo_pkg
-        candidate = os.path.join(
-            os.path.dirname(sumo_pkg.__file__), "bin",
-            "sumo.exe" if platform.system() == "Windows" else "sumo")
-        if os.path.exists(candidate):
-            return candidate
-    except ImportError:
-        pass
-    # Last resort: whatever's on PATH.
-    return "sumo"
+# ------------------------------------------------------------------ one run
 
+def run_one(driver, sumo, *, out_prefix, label, scheduler="heft", offloading="eft",
+            workload="synthetic", load=0.4, arrival_rate=None, seed=1, slots=0,
+            warmup=60.0, duration=300.0, drain=120.0, mock=False, gui=False, gui_delay=50,
+            extra=(), quiet=False):
+    """Run iov_sim once (starting and stopping SUMO around it)."""
+    os.makedirs(os.path.dirname(os.path.join(REPO_ROOT, out_prefix)), exist_ok=True)
+    args = ["--scheduler", scheduler, "--offloading", offloading, "--workload", workload,
+            "--seed", str(seed), "--server-slots", str(slots), "--warmup", str(warmup),
+            "--duration", str(duration), "--drain", str(drain),
+            "--out-prefix", out_prefix, "--label", label]
+    args += ["--arrival-rate", str(arrival_rate)] if arrival_rate is not None else ["--load", str(load)]
+    args += list(extra)
+    out = subprocess.DEVNULL if quiet else None
 
-def run_one(scenario, scheduler, offloading, duration, step_length, arrival_rate,
-            seed, out_prefix, label, driver_bin, sumo_bin, use_mock=False, quiet=False):
-    os.makedirs(os.path.dirname(out_prefix) or ".", exist_ok=True)
-
-    if use_mock:
-        cmd = [driver_bin, "--mock", "--duration", str(duration), "--scheduler", scheduler,
-               "--offloading", offloading, "--arrival-rate", str(arrival_rate),
-               "--seed", str(seed), "--out-prefix", out_prefix, "--label", label]
-        if not quiet:
-            print(f"[{label}] running against mock mobility...")
-        subprocess.run(cmd, check=True, cwd=REPO_ROOT)
+    if mock:
+        subprocess.run([driver, "--mock"] + args, check=True, cwd=REPO_ROOT, stdout=out)
         return
 
-    port = find_free_port()
-    sumo_cmd = [sumo_bin, "-c", scenario, "--remote-port", str(port),
-                "--step-length", str(step_length)]
-    if not quiet:
-        print(f"[{label}] starting SUMO on port {port}: {' '.join(sumo_cmd)}")
-    sumo_proc = subprocess.Popen(sumo_cmd, cwd=REPO_ROOT,
-                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    try:
-        # No readiness probe here on purpose: SUMO's TraCI server accepts
-        # exactly one client connection, and any probe connect() would
-        # itself consume that slot before experiment_driver gets to it.
-        # experiment_driver's TraciClient already retries its own
-        # connection attempts internally, so we just give the process a
-        # brief head start and let it handle the rest.
-        time.sleep(0.3)
-        driver_cmd = [driver_bin, "--port", str(port), "--duration", str(duration),
-                      "--step-length", str(step_length), "--scheduler", scheduler,
-                      "--offloading", offloading, "--arrival-rate", str(arrival_rate),
-                      "--seed", str(seed), "--out-prefix", out_prefix, "--label", label]
-        if not quiet:
-            print(f"[{label}] running experiment_driver...")
-        subprocess.run(driver_cmd, check=True, cwd=REPO_ROOT)
-    finally:
-        sumo_proc.terminate()
+    for attempt in range(3):  # retry if another process grabbed the port
+        port = free_port()
+        sumo_cmd = [sumo, "-c", os.path.join("sumo_scenario", "grid.sumocfg"),
+                    "--remote-port", str(port), "--step-length", "0.1"]
+        if gui:
+            sumo_cmd += ["--gui-settings-file", os.path.join("sumo_scenario", "gui-settings.xml"),
+                         "--start", "--quit-on-end", "--delay", str(gui_delay)]
+        sumo_proc = subprocess.Popen(sumo_cmd, cwd=REPO_ROOT,
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
-            sumo_proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            sumo_proc.kill()
+            # No port probe here: SUMO accepts exactly one TraCI client, so a
+            # probe would steal it. iov_sim retries its own connection.
+            time.sleep(0.2)
+            cmd = [driver, "--port", str(port)] + args + (["--color-vehicles"] if gui else [])
+            result = subprocess.run(cmd, cwd=REPO_ROOT, stdout=out)
+            if result.returncode == 0:
+                return
+            if sumo_proc.poll() is None or attempt == 2:
+                raise RuntimeError(f"iov_sim failed for {out_prefix} (exit {result.returncode})")
+        finally:
+            if sumo_proc.poll() is None:
+                sumo_proc.terminate()
+                try:
+                    sumo_proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    sumo_proc.kill()
 
+
+def run_many(driver, sumo, jobs, n_parallel, progress_every=20):
+    """jobs: list of dicts of run_one keyword arguments. Returns their out_prefixes."""
+    t0, done, prefixes = time.time(), 0, []
+    with ThreadPoolExecutor(max_workers=n_parallel) as ex:
+        futures = [ex.submit(run_one, driver, sumo, quiet=True, **j) for j in jobs]
+        for f in as_completed(futures):
+            f.result()  # re-raises if a run failed
+            done += 1
+            if done % progress_every == 0 or done == len(jobs):
+                print(f"  {done}/{len(jobs)} runs done ({time.time() - t0:.0f} s)", flush=True)
+    return [j["out_prefix"] for j in jobs]
+
+
+def merge_csvs(paths, dest):
+    rows, header = [], None
+    for p in paths:
+        with open(p, newline="") as f:
+            r = list(csv.reader(f))
+        header = header or r[0]
+        rows.extend(r[1:])
+    with open(dest, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(header)
+        w.writerows(rows)
+
+
+# ------------------------------------------------------------------ sweep
+
+def sweep_jobs(loads, seeds, mock):
+    """The two experiments reported in the README (duplicates removed)."""
+    configs = set()
+    # A: offloading benchmark (incl. ML) on both workloads, HEFT-lite order, no admission limit.
+    for wl, pol in itertools.product(WORKLOADS, POLICIES):
+        configs.add((wl, "heft", pol, 0))
+    # B: scheduler comparison, EFT offloading, with and without an admission limit.
+    for wl, sch, slots in itertools.product(WORKLOADS, SCHEDULERS, [0, 5]):
+        configs.add((wl, sch, "eft", slots))
+    jobs = []
+    for (wl, sch, pol, slots), load, seed in itertools.product(sorted(configs), loads, seeds):
+        prefix = os.path.join("results", "sweep", f"{wl}_{sch}_{pol}_k{slots}_u{load:g}_s{seed}")
+        jobs.append(dict(out_prefix=prefix, label=f"{sch}_{pol}", scheduler=sch, offloading=pol,
+                         workload=wl, load=load, seed=seed, slots=slots, mock=mock,
+                         extra=[] if seed == 1 else ["--light"]))  # full logs only for seed 1
+    return jobs
+
+
+# ------------------------------------------------------------------ main
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--scenario", default="sumo_scenario/grid.sumocfg")
-    parser.add_argument("--scheduler", default="heft", choices=["heft", "fifo"])
-    parser.add_argument("--offloading", default="greedy", choices=["greedy", "nearest"])
-    parser.add_argument("--duration", type=float, default=200.0)
-    parser.add_argument("--step-length", type=float, default=0.1)
-    parser.add_argument("--arrival-rate", type=float, default=0.5)
-    parser.add_argument("--seed", type=int, default=1)
-    parser.add_argument("--out-prefix", default="results/run")
-    parser.add_argument("--label", default=None)
-    parser.add_argument("--mock", action="store_true", help="use synthetic mobility instead of SUMO")
-    parser.add_argument("--driver-bin", default=os.path.join(REPO_ROOT, "experiment_driver"))
-    parser.add_argument("--sumo-bin", default=None)
-    parser.add_argument("--sweep", action="store_true",
-                         help="run every scheduler x offloading combo x 3 seeds, for the comparison plots")
-    parser.add_argument("--sweep-seeds", default="1,2,3")
-    parser.add_argument("--sweep-duration", type=float, default=200.0)
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--scheduler", default="heft", choices=SCHEDULERS)
+    ap.add_argument("--offloading", default="eft", choices=POLICIES + ["random"])
+    ap.add_argument("--workload", default="synthetic", choices=WORKLOADS)
+    ap.add_argument("--load", type=float, default=0.4,
+                    help="offered load: arriving work / total server capacity (default 0.4)")
+    ap.add_argument("--arrival-rate", type=float, default=None, help="DAGs per second instead of --load")
+    ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--server-slots", type=int, default=0,
+                    help="max tasks a server holds at once (uploading+queued+running); 0 = unlimited")
+    ap.add_argument("--warmup", type=float, default=60.0)
+    ap.add_argument("--duration", type=float, default=300.0)
+    ap.add_argument("--drain", type=float, default=120.0)
+    ap.add_argument("--out-prefix", default=os.path.join("results", "run"))
+    ap.add_argument("--log-positions", action="store_true", help="write vehicle positions (for visualize.py)")
+    ap.add_argument("--mock", action="store_true", help="synthetic vehicles, no SUMO needed")
+    ap.add_argument("--gui", action="store_true", help="show the run live in sumo-gui")
+    ap.add_argument("--gui-delay", type=int, default=50, help="ms between GUI steps (default 50)")
+    ap.add_argument("--driver-bin", default=None, help="path to iov_sim (auto-detected)")
+    ap.add_argument("--sweep", action="store_true", help="run every experiment in the README")
+    ap.add_argument("--sweep-loads", default="0.2,0.4,0.6,0.8")
+    ap.add_argument("--sweep-seeds", type=int, default=10, help="number of seeds (1..N)")
+    ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2),
+                    help="parallel runs during --sweep")
+    a = ap.parse_args()
 
-    if not os.path.exists(args.driver_bin) and not os.path.exists(args.driver_bin + ".exe"):
-        sys.exit(f"experiment_driver not found at {args.driver_bin} -- build it first (see README.md)")
+    driver = find_driver(a.driver_bin)
+    sumo = None if a.mock else find_sumo(a.gui)
 
-    sumo_bin = args.sumo_bin or find_sumo_binary()
-
-    if args.sweep:
-        seeds = [int(s) for s in args.sweep_seeds.split(",")]
-        combos = list(itertools.product(["heft", "fifo"], ["greedy", "nearest"], seeds))
-        print(f"Running sweep: {len(combos)} configs ({args.sweep_duration}s each)...")
-        # Fresh summary each sweep run.
-        summary_path = os.path.join(REPO_ROOT, "results", "summary.csv")
-        if os.path.exists(summary_path):
-            os.remove(summary_path)
-        for scheduler, offloading, seed in combos:
-            label = f"{scheduler}_{offloading}_seed{seed}"
-            out_prefix = os.path.join("results", "sweep", label)
-            run_one(args.scenario, scheduler, offloading, args.sweep_duration, args.step_length,
-                    args.arrival_rate, seed, out_prefix, label, args.driver_bin, sumo_bin,
-                    use_mock=args.mock, quiet=True)
-            print(f"  done: {label}")
-        print("Sweep complete. See results/summary.csv and results/sweep/*.csv")
+    if not a.sweep:
+        check_inputs([a.workload], [a.offloading])
+        label = f"{a.scheduler}_{a.offloading}"
+        load_txt = f"{a.arrival_rate} DAG/s" if a.arrival_rate is not None else f"load {a.load}"
+        print(f"Running {label} on the {a.workload} workload at {load_txt}"
+              + (" (mock mobility)" if a.mock else f" with {os.path.basename(sumo)}"), flush=True)
+        run_one(driver, sumo, out_prefix=a.out_prefix, label=label, scheduler=a.scheduler,
+                offloading=a.offloading, workload=a.workload, load=a.load, arrival_rate=a.arrival_rate,
+                seed=a.seed, slots=a.server_slots, warmup=a.warmup, duration=a.duration, drain=a.drain,
+                mock=a.mock, gui=a.gui, gui_delay=a.gui_delay,
+                extra=["--log-positions"] if a.log_positions else [])
+        print(f"Outputs: {a.out_prefix}_*.csv", flush=True)
         return
 
-    label = args.label or f"{args.scheduler}_{args.offloading}"
-    run_one(args.scenario, args.scheduler, args.offloading, args.duration, args.step_length,
-            args.arrival_rate, args.seed, args.out_prefix, label, args.driver_bin, sumo_bin,
-            use_mock=args.mock)
+    check_inputs(WORKLOADS, POLICIES)
+    loads = [float(x) for x in a.sweep_loads.split(",")]
+    jobs = sweep_jobs(loads, range(1, a.sweep_seeds + 1), a.mock)
+    sweep_dir = os.path.join(REPO_ROOT, "results", "sweep")
+    if os.path.isdir(sweep_dir):
+        shutil.rmtree(sweep_dir)
+    print(f"Sweep: {len(jobs)} runs, {a.jobs} in parallel...", flush=True)
+    prefixes = run_many(driver, sumo, jobs, a.jobs)
+    merge_csvs(sorted(os.path.join(REPO_ROOT, p + "_summary.csv") for p in prefixes),
+               os.path.join(REPO_ROOT, "results", "summary.csv"))
+    print("Wrote results/summary.csv. Next: python plot_results.py", flush=True)
 
 
 if __name__ == "__main__":

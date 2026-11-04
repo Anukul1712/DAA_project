@@ -1,43 +1,24 @@
-# Queue & Resource Allocation Manager
+# Resource management (server queues)
 
-**Owner:** Member 3
+Simulates the edge servers. `FifoResourceAllocator` (`fifo_resource_allocator.h`)
+keeps, for each server:
 
-## What this module owns
+1. **Uploading** tasks: admitted, but their input data is still on the way.
+2. **Queue**: data has arrived; tasks run one at a time, in arrival order.
 
-- Per-edge-server queue state (what's waiting, what's executing)
-- Heterogeneous resource modeling (servers differ in CPU/bandwidth
-  capacity)
-- Admission/execution of assigned tasks, and reporting live queue-length
-  and load state back to `offloading/` so it can make congestion-aware
-  decisions
-- Swappable allocation policy via `IResourceAllocator` (e.g. FIFO,
-  priority queue, capacity-weighted)
+A server does `cpu_capacity` mega-cycles of work per millisecond. The
+simulation is exact rather than tick-rounded: if a task finishes halfway
+through a 100 ms tick, the next task starts at that moment, and the finish
+time is reported precisely. So a fast server really is faster.
 
-## Interface contract
+`state()` reports, per server, how many tasks it holds and how much work is
+still pending (uploading + queued + the rest of the running task). The
+offloading policies use this. `busyMs()` gives CPU busy time, for utilisation.
 
-```
-(Offloading Engine) --assignment--> IResourceAllocator --admits/executes--> Server queues
-                                            |
-                                            +--> queue/load state exposed back to Offloading Engine
-```
+| File | What it is |
+|---|---|
+| `resource_allocator.h` | `ServerSpec`, `Job`, `Completion` and the `IResourceAllocator` interface |
+| `fifo_resource_allocator.h` | The FIFO implementation described above |
 
-## Status
-
-- [x] Per-server queue data structure implemented (`std::deque<QueueEntry>`
-      per server in `FifoResourceAllocator`)
-- [x] Heterogeneous capacity modeling — each `ServerSpec` has its own
-      `cpu_capacity`
-- [x] `IResourceAllocator` interface + concrete `FifoResourceAllocator`
-      (`fifo_resource_allocator.h`)
-- [x] State-reporting API (`currentState()`) that `offloading/` queries
-      each tick
-- [ ] Priority-queue variant (currently FIFO only)
-- [ ] Queue-length-over-time logging for a congestion plot
-
-## What to present at mid-eval
-
-- `tick(dt_ms)`: head-of-line task on each server loses
-  `cpu_capacity * dt` of remaining workload per tick — this is the
-  "dynamic queue congestion" and "heterogeneous resources" requirement
-  from the objective, made concrete
-- `currentState()` as the live feedback loop into the offloading decision
+Tests: `tests/run_tests.cpp` checks exact finish times, work spanning
+several ticks, waiting for uploads, and queue order.

@@ -4,8 +4,9 @@ This is the ground truth `traci_client.h` is implemented against, captured
 by monkey-patching `socket.sendall`/`recv` inside the official Python
 `traci` client talking to a real `sumo 1.27.1` process, then decoding the
 bytes with `traci`'s own `Storage` class (not by hand) to eliminate
-guesswork. Reproduce with `/tmp/dump.py`-style capture if the protocol
-ever needs re-verifying against a newer SUMO version.
+guesswork. (The capture script was a one-off and is not in this repo; to
+re-verify against a newer SUMO, wrap `socket.sendall`/`recv` the same way.)
+The framing code is also covered by unit tests in `tests/run_tests.cpp`.
 
 ## Message framing
 ```
@@ -16,9 +17,16 @@ ever needs re-verifying against a newer SUMO version.
 ```
 [1-byte length, INCLUDING this byte][cmdId][payload]
 ```
-If a sub-command would be >= 255 bytes, the length byte is `0x00`
-followed by a 4-byte big-endian extended length (seen on the *receive*
-side once a vehicle-id-list answer gets long).
+If the sub-command would be longer than 255 bytes, the extended form is
+used instead:
+```
+[0x00][4-byte big-endian length][cmdId][payload]
+```
+where the 4-byte length counts the whole sub-command, i.e.
+`1 + 4 + 1 + len(payload)`. SUMO uses this on the *receive* side once a
+vehicle-id-list answer gets long. (An earlier version of `traci_client.h`
+wrote `5 + len(payload)` here; it never triggered in practice because our
+requests are short, but it is fixed and unit-tested now.)
 
 ## Strings
 ```
@@ -52,6 +60,13 @@ Request payload: `[double targetTime]` — `0.0` means "advance exactly
 one step". Response is just the status, with `[int32 subscriptionCount]`
 appended (0 here, since we never issue TraCI subscriptions — every GET
 is a fresh polled command instead of a persistent subscription).
+
+## CMD_SET_VEHICLE_VARIABLE (0xc4), VAR_COLOR (0x45)
+Used only for the sumo-gui view (`--gui`). Request payload:
+`[0x45][objectIdString][0x11 TYPE_COLOR][r][g][b][a]`. The response is just
+the status entry (no answer). An error status is returned if the vehicle
+has already left the network, so `SumoBridge` only recolours vehicles that
+were present in the last step.
 
 ## Worked example (all captured live, hex)
 ```

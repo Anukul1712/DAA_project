@@ -1,459 +1,291 @@
-# IoV Edge Task Scheduling under Real Vehicular Mobility
+# DAG Task Scheduling and Offloading for Connected Vehicles
 
-A DAG-based task scheduling and offloading pipeline for Internet-of-Vehicles
-(IoV) edge computing, evaluated against **real SUMO traffic simulation**
-(not synthetic mobility) over a live TraCI connection driven by a
-from-scratch C++ client.
+Vehicles generate small applications made of dependent tasks (a **DAG**:
+for example *sense → detect → plan*). Each task is sent over a wireless link
+to one of four **edge servers** beside the road. This project simulates that,
+using **real vehicle movement from the SUMO traffic simulator**, and compares
+ways of deciding:
 
-> **TL;DR result:** a load-aware offloading policy (queue length + link
-> latency) reduces mean end-to-end task latency by **11.6%** and P95
-> latency by **15.0%** versus a naive nearest-server policy, measured
-> across 3 seeds × 1,029 real tasks under real vehicle-driven channel
-> conditions from a 4×4 SUMO grid network. See [Results](#results).
+1. **Which server runs each task** (offloading). Our policy is **EFT**
+   (Earliest Finish Time). It is compared against two simple rules and a
+   **machine-learning (ML) baseline**: a neural network trained to predict
+   task finish times.
+2. **Which waiting task goes first** (scheduling): *HEFT-lite* vs *FIFO*.
 
----
+The policies are tested on two workloads: small random DAGs, and **real
+workflow DAG structures from the public WfCommons dataset**. The goal is a
+short **makespan**: the time from a DAG's arrival until its last task is
+finished.
 
-## Table of Contents
+![Vehicles on the SUMO grid, coloured by the server running their tasks](results/plots/network_animation.gif)
 
-- [Problem Statement](#problem-statement)
-- [System Architecture](#system-architecture)
-- [Module Breakdown](#module-breakdown)
-- [The SUMO / TraCI Integration](#the-sumo--traci-integration)
-- [Experimental Setup](#experimental-setup)
-- [Results](#results)
-- [A Logging Bug Worth Documenting](#a-logging-bug-worth-documenting)
-- [Discussion & Limitations](#discussion--limitations)
-- [Repository Structure](#repository-structure)
-- [Building & Running](#building--running)
-- [Future Work](#future-work)
+*Vehicles from SUMO on a 600 m × 600 m grid. The four coloured circles are
+edge servers. A vehicle takes a server's colour while its tasks run there.*
 
 ---
 
-## Problem Statement
+## Results in short
 
-Vehicles in an IoV network generate compute tasks — often structured as
-**DAGs** (directed acyclic graphs) of sub-tasks with data dependencies,
-e.g. a perception pipeline: `sense → preprocess → {detect, segment} →
-fuse → decide`. Each vehicle can execute tasks locally or **offload**
-them to one of several roadside edge servers. Two decisions compound:
+- **EFT gives the shortest makespan in every setting tested:** both
+  workloads, all four load levels, and in 79 of 80 paired seed comparisons
+  against the ML baseline.
+- **The ML baseline comes second.** It is 0.3–2% slower than EFT on the
+  synthetic DAGs and 4–7.5% slower on the real workflow DAGs, but clearly
+  better than the two simple rules.
+- **Least-loaded** (ignores distance) is 6–32% slower than EFT.
+  **Nearest** (ignores load) collapses as load grows: up to 11× slower.
+- **HEFT-lite vs FIFO:** when servers accept every task, HEFT-lite is
+  slightly faster (0.3–1.2%). When servers only accept 5 tasks at a time
+  and load is high, HEFT-lite is much *worse* (20% on synthetic, 140% on
+  real DAGs at 80% load), because it keeps starting new DAGs instead of
+  finishing old ones.
 
-1. **Scheduling** — given several ready sub-tasks, which order should
-   they be dispatched in? (naive FIFO vs. critical-path-aware ordering)
-2. **Offloading** — for a given task, which edge server should receive
-   it? A server might be geographically closer (lower link latency) but
-   already congested (long queue), or farther but idle.
+All results are means over 10 seeds with 95% confidence intervals, from
+560 simulation runs (`results/summary.csv`, `results/aggregate.csv`,
+`results/paired_vs_eft.csv`).
 
-The complication that makes this specifically an *IoV* problem rather
-than a generic scheduling problem: **link latency is not static.**
-Vehicles move, so vehicle-to-server proximity — and therefore link
-quality — changes every simulation tick. A policy that looks optimal
-against a snapshot of network conditions can be wrong a few seconds
-later. This project evaluates scheduling/offloading policies under that
-actual dynamic, using SUMO to generate the mobility rather than
-approximating it.
+---
 
-## System Architecture
+## How it works
 
-```mermaid
-flowchart LR
-    subgraph Mobility["simulation/sumo_integration"]
-        direction TB
-        SUMO[("Real SUMO process\n(4x4 grid, 200 routed vehicles)")]
-        TC["traci_client.h\n(raw TCP, hand-rolled protocol)"]
-        SB["SumoBridge\n(IMobilityProvider)"]
-        SUMO <-->|"TraCI wire protocol"| TC --> SB
-    end
-
-    subgraph Scheduling["src/scheduling"]
-        SCH["ITaskScheduler\nHeftLiteScheduler | FifoScheduler"]
-    end
-
-    subgraph Offloading["src/offloading"]
-        OFF["IOffloadingPolicy\nGreedyLatencyLoadPolicy | NearestServerPolicy"]
-    end
-
-    subgraph ResourceMgmt["src/resource_mgmt"]
-        RA["FifoResourceAllocator\n(per-server queues, heterogeneous capacity)"]
-    end
-
-    SB -->|"link_latency_ms(vehicle, server)"| OFF
-    SCH -->|"dispatch order"| OFF
-    OFF -->|"admit(server, task)"| RA
-    RA -->|"ServerState\n(queue_length, link_latency_ms)"| OFF
-    RA -->|"completed task ids"| Driver
-
-    Driver["main.cpp\nexperiment driver:\nrandom DAG arrivals, CSV metrics"]
+```
+ SUMO (traffic)  ──positions──►  iov_sim  (every 0.1 s of simulated time)
+                                  │
+   1. advance SUMO one step, read every vehicle's position
+   2. run the edge servers forward; finished tasks unlock their children
+   3. new DAGs arrive at random, each owned by a random vehicle
+   4. SCHEDULER sorts all waiting tasks  ─►  OFFLOADING POLICY picks a server for each
+   5. log metrics
 ```
 
-Every module talks to the others only through an abstract interface
-(`IMobilityProvider`, `ITaskScheduler`, `IOffloadingPolicy`,
-`IResourceAllocator`), so any concrete implementation is a drop-in swap.
-This is what made it possible to develop `SumoBridge` against a working
-pipeline that had been running on `MockMobilityProvider` from day one,
-and to add `FifoScheduler` / `NearestServerPolicy` as baselines without
-touching anything else.
+Each task goes through these steps:
 
-## Module Breakdown
+```
+ready ──► wait for a decision ──► upload over the vehicle's link ──► queue at server ──► execute ──► done
+          (next 0.1 s tick)       (latency + data ÷ rate,             (FIFO)              (work ÷ server
+                                   both depend on distance)                                speed)
+```
 
-| Module | Interface | Concrete implementations |
+| Part | Folder | What it does |
 |---|---|---|
-| `simulation/sumo_integration/` | `IMobilityProvider` | `MockMobilityProvider` (synthetic, circular paths) · `SumoBridge` (real, via TraCI) |
-| `src/scheduling/` | `ITaskScheduler` | `HeftLiteScheduler` (critical-path / upward-rank priority) · `FifoScheduler` (creation-order baseline) |
-| `src/offloading/` | `IOffloadingPolicy` | `GreedyLatencyLoadPolicy` (load + latency, weighted) · `NearestServerPolicy` (latency-only baseline) |
-| `src/resource_mgmt/` | `IResourceAllocator` | `FifoResourceAllocator` (per-server FIFO queues, heterogeneous CPU capacity) |
+| Scheduling | [`src/scheduling/`](src/scheduling/README.md) | HEFT-lite, FIFO, workloads (random and real DAGs) |
+| Offloading | [`src/offloading/`](src/offloading/README.md) | EFT, Least-loaded, Nearest, ML |
+| Servers | [`src/resource_mgmt/`](src/resource_mgmt/README.md) | Exact FIFO queues with an upload phase |
+| Mobility | [`simulation/sumo_integration/`](simulation/sumo_integration/README.md) | TraCI client for SUMO, mock mobility, link model |
+| ML model | [`ml/`](ml/README.md) | Training script and the trained neural network |
+| Dataset | [`data/`](data/README.md) | Script that builds the real-DAG workload from WfCommons |
+| Driver | `main.cpp` | Ties everything together and writes CSV results |
 
-**`HeftLiteScheduler`** computes each task's *upward rank* — its own
-workload plus the maximum rank among its dependents — once per DAG, then
-dispatches ready tasks highest-rank-first. This is a simplified HEFT
-(Heterogeneous Earliest Finish Time) rule: tasks on the longest
-remaining dependency chain get priority, since delaying them delays
-everything downstream.
+### The policies
 
-**`GreedyLatencyLoadPolicy`** scores each candidate server as
-`(queue_length / cpu_capacity) + latency_weight * link_latency_ms` and
-picks the minimum — jointly considering congestion and proximity rather
-than either alone.
+| Offloading policy | Chooses the server with… |
+|---|---|
+| **EFT** (ours) | the earliest estimated finish time: `max(upload, backlog) + work ÷ speed`, all in ms |
+| **ML** (neural network) | the lowest finish time *predicted by a trained neural network* from raw inputs (distance, data size, work, server speed, server backlog, tasks at server) |
+| **Least-loaded** | the shortest backlog (pending work ÷ speed); ignores distance |
+| **Nearest** | the lowest link latency; ignores load |
 
-## The SUMO / TraCI Integration
+| Scheduler | Waiting tasks are dispatched… |
+|---|---|
+| **HEFT-lite** | highest *upward rank* first, i.e. the task with the longest remaining chain of work after it in its DAG (the ordering step of the HEFT algorithm) |
+| **FIFO** | in the order they became ready |
 
-This is the part of the project worth explaining in detail, because it
-went through a real failed attempt before succeeding, and the failure
-mode is instructive.
+---
 
-### Why TraCI-over-socket, not libsumo
+## Experimental setup
 
-The original plan (see module status history) was to link **libsumo**,
-SUMO's in-process C++ API — faster than a socket round trip, no separate
-process to manage. In practice, linking libsumo's C++ library turned out
-to require either building SUMO from source with `--enable-libsumo` or
-locating prebuilt dev binaries for the target toolchain (MSYS2 UCRT64);
-neither was a clean fit for a project already standardized on
-`pip install eclipse-sumo` for the SUMO binaries themselves. The pivot:
-implement the same **TraCI wire protocol** the official Python client
-speaks, over a plain TCP socket. This trades a small per-tick round-trip
-cost for zero linking dependencies beyond the `sumo` executable itself —
-worth it at this project's scale (a few hundred vehicles, sub-second
-tick budgets).
+| | |
+|---|---|
+| Road network | SUMO 4×4 grid, 200 m blocks (600 m × 600 m) |
+| Traffic | 500 random trips, 1 departure per second; 56–86 vehicles on the road during the measurement |
+| Edge servers | 4, near the corners: S0 2.0, S1 3.0, S2 3.0, **S3 6.0** Mcycles/ms (S3 is the fast one) |
+| Synthetic workload | random DAGs of 3–6 tasks; each task depends on 1–2 earlier ones; work 100–500 Mcycles; input 50–400 KB |
+| Real-DAG workload | 9 real workflows from [WfCommons](https://github.com/wfcommons/WfInstances) (Montage, Epigenomics, 1000Genome, BLAST, …), 22–104 tasks each; real structure and relative task sizes, rescaled to the same mean work and data as the synthetic tasks ([details](data/README.md)) |
+| Load | 20%, 40%, 60%, 80% of total server capacity (Poisson arrivals for 300 s after a 60 s warm-up) |
+| Link model | latency = 2 ms + 0.05 ms/m; upload rate = 5 KB/ms ÷ (1 + distance / 200 m) |
+| Admission | unlimited, or at most 5 tasks per server (scheduler experiment only) |
+| ML training | separate seeds (1001–1004) from the evaluation seeds (1–10); see [ml/README.md](ml/README.md) |
+| Repetitions | 10 seeds per configuration, 560 runs in total |
 
-### Reverse-engineering the protocol correctly
+"Load" counts only CPU work. Upload times come on top, so 80% load is
+already close to what the servers can handle.
 
-An earlier attempt at this got stuck hand-decoding raw hex dumps of the
-TraCI byte stream and mis-split multi-byte fields by eye. The fix that
-actually worked: **decode programmatically, not manually.**
-
-1. Monkey-patch `socket.sendall`/`recv` inside the *official* Python
-   `traci` client so every byte sent and received is logged, tagged with
-   which API call produced it.
-2. Run that instrumented client against a real `sumo` process, calling
-   `getIDList()`, `getPosition()`, `getSpeed()`, `simulationStep()`.
-3. Feed the captured bytes back through `traci`'s own `Storage` class
-   (`readInt`, `readDouble`, `readString`, …) instead of counting hex
-   pairs by hand. This makes the ground truth mechanically checkable —
-   the decode either round-trips correctly through the same parsing code
-   TraCI itself uses, or it visibly throws.
-
-The full worked decode, with every field labeled and a real captured
-example, lives in
-[`simulation/sumo_integration/TRACI_PROTOCOL_NOTES.md`](simulation/sumo_integration/TRACI_PROTOCOL_NOTES.md).
-The short version:
-
-- **Message framing:** `[4-byte big-endian length, including itself][body]`
-- **Command framing:** `[1-byte length, including itself][cmdId][payload]`,
-  falling back to an extended `0x00 + 4-byte length` form once a
-  sub-command would exceed 255 bytes (this matters in practice — a
-  vehicle-id-list response with 70+ vehicles exceeds it)
-- **Every command gets a status reply:** `[len][cmdId][resultCode][errorString]`
-- **GET commands additionally get an answer:**
-  `[len][cmdId+0x10][variableId][objectId][valueType][value…]`
-
-`traci_client.h` implements exactly this subset (`CMD_SIMSTEP`,
-`CMD_GET_VEHICLE_VARIABLE` for position/speed/id-list, `CMD_CLOSE`) as a
-portable class — `#ifdef _WIN32` switches between Winsock and POSIX
-sockets, everything else is identical on both platforms.
-
-### One more real bug, for the record
-
-The runner script (`run_experiment.py`) originally probed the TraCI port
-for readiness before launching the C++ driver — a normal-looking
-"wait until the server is listening" pattern. It caused every run to
-fail on the *first* connection attempt, with SUMO closing the socket.
-Root cause: SUMO's TraCI server accepts **exactly one** client
-connection; the readiness probe's own `connect()` consumed that slot,
-so the real client's connection attempt found nothing listening. Fixed
-by removing the probe entirely and relying on `TraciClient::connect`'s
-own internal retry loop — the correct fix, in retrospect, since it also
-removes a race condition the probe had.
-
-## Experimental Setup
-
-**Network:** a 4×4 Manhattan grid generated with SUMO's `netgenerate`
-(200 m edge length, spanning `(0,0)` to `(600,600)`).
-
-**Traffic demand:** 200 vehicle routes generated with `randomTrips.py`
-and routed with `duarouter`, departing over a 0–200 s window. A
-standalone verification run (`sumo_scenario/tripinfo_test.xml`) confirms
-117 of 200 trips complete within that window with the default vehicle
-type — i.e. this is a real, congestion-capable traffic scenario, not a
-handful of vehicles driving in circles.
-
-**Edge servers:** 2 heterogeneous servers placed at opposite corners of
-the grid — `server 100` at `(100, 100)`, capacity 1.0, `server 101` at
-`(500, 500)`, capacity 2.5 (faster).
-
-**Latency model:** `estimateLatencyMs = 2.0 + 0.05 × distance_m` — a
-documented analytic model (fixed processing/propagation overhead + a
-distance-scaled term) applied on top of *real* SUMO vehicle positions.
-This is standard practice in vehicular-edge literature (real mobility +
-analytic channel model) — it is explicitly not a full radio/backhaul
-simulator, and this README says so rather than implying otherwise.
-
-**Workload:** rather than one fixed DAG, `main.cpp` continuously spawns
-random fork-join DAGs (3–6 tasks, 1–2 dependencies per non-root task,
-workload ~U(20,80)) as a Poisson-ish arrival process (mean 1.2 DAGs/s),
-each "owned" by a randomly chosen vehicle currently present in the
-simulation — that vehicle's real-time position drives the link-latency
-term for all of that DAG's offloading decisions.
-
-**Configurations compared:** the 2×2 factorial of
-`{HeftLiteScheduler, FifoScheduler} × {GreedyLatencyLoadPolicy,
-NearestServerPolicy}`, each run for a full 200 s simulated duration
-across 3 seeds (1, 2, 3).
+---
 
 ## Results
 
-### Real mobility actually driving the pipeline
+### 1. Offloading benchmark: EFT vs ML vs simple rules
 
-![Mobility and congestion over time](results/plots/mobility_and_congestion.png)
+![Mean and P95 makespan vs load, both workloads](results/plots/policies_vs_load.png)
 
-This is the load-bearing plot for the claim "this is a real SUMO
-integration." Top panel: vehicle count in the simulation ramps from 0 to
-a peak of **79** as SUMO's route file departs vehicles over time, then
-plateaus and fluctuates as vehicles arrive at their destinations and
-leave the network — this shape is a direct readout of SUMO's own
-routing, not something the C++ code invented. Middle panel: **ambient**
-link latency — the mean latency from every vehicle currently in the
-simulation to each server, recomputed independently every tick —
-tracks between **13.9 ms and 22.9 ms** as traffic spreads across the
-grid; it climbs while vehicles are still concentrated near their entry
-points and settles once they've distributed across all 16 blocks. This
-is deliberately a network-wide aggregate, not a single vehicle's trace:
-the latency actually used for each task's own offloading *decision* is
-computed fresh, per task, from that task's specific owner vehicle at
-dispatch time — see the note in `main.cpp` (`decision_state`) and the
-[correction below](#a-logging-bug-worth-documenting) for why those two
-numbers are deliberately kept separate. Bottom panel: server queue depth occasionally
-spikes to 2–3 tasks as arrivals briefly outpace one server's service
-rate, then drains — visible, if modest, congestion dynamics.
+Mean DAG makespan in seconds (HEFT-lite order, unlimited admission, ± 95% CI):
 
-### Offloading policy comparison
+| Load | EFT (ours) | ML | Least-loaded | Nearest |
+|---:|---:|---:|---:|---:|
+| **Synthetic DAGs** | | | | |
+| 20% | **0.79** ± 0.01 | 0.79 ± 0.01 | 1.05 ± 0.01 | 0.97 ± 0.03 |
+| 40% | **0.83** ± 0.01 | 0.84 ± 0.01 | 1.02 ± 0.01 | 1.38 ± 0.09 |
+| 60% | **0.91** ± 0.01 | 0.92 ± 0.01 | 1.07 ± 0.01 | 3.71 ± 0.55 |
+| 80% | **1.14** ± 0.05 | 1.16 ± 0.05 | 1.28 ± 0.05 | 12.2 ± 1.5 |
+| **Real workflow DAGs** | | | | |
+| 20% | **3.24** ± 0.35 | 3.49 ± 0.38 | 4.05 ± 0.40 | 10.3 ± 1.3 |
+| 40% | **3.89** ± 0.45 | 4.15 ± 0.49 | 4.69 ± 0.44 | 15.2 ± 2.0 |
+| 60% | **5.42** ± 0.54 | 5.78 ± 0.55 | 6.14 ± 0.57 | 26.4 ± 4.1 |
+| 80% | **9.69** ± 1.58 | 10.08 ± 1.63 | 10.24 ± 1.59 | 41.9 ± 5.5 |
 
-![Latency by configuration](results/plots/latency_by_config.png)
+The confidence intervals overlap for EFT and ML because the runs differ a
+lot from seed to seed (different traffic and different DAGs). Comparing the
+two policies **on the same seed** removes that noise and shows the gap
+clearly:
 
-| Configuration | Mean latency (s) | Median (s) | P95 (s) | Max (s) |
-|---|---:|---:|---:|---:|
-| `heft` + `greedy`   | **0.225** | 0.200 | **0.567** | 1.167 |
-| `fifo` + `greedy`   | **0.225** | 0.200 | **0.567** | 1.100 |
-| `heft` + `nearest`  | 0.254 | 0.200 | 0.662 | 1.467 |
-| `fifo` + `nearest`  | 0.254 | 0.200 | 0.672 | 1.533 |
+![Extra makespan vs EFT, paired by seed](results/plots/benchmark_vs_eft.png)
 
-*(mean over 3 seeds; ~1,029 completed tasks per configuration)*
+| | ML vs EFT | Least-loaded vs EFT |
+|---|---|---|
+| Synthetic DAGs | +0.3% to +2.0% slower (EFT better in 39 of 40 runs) | +13% to +32% slower |
+| Real workflow DAGs | +4.0% to +7.5% slower (EFT better in 40 of 40 runs) | +6% to +25% slower |
 
-**Load-aware offloading (`greedy`) beats latency-only offloading
-(`nearest`) on every metric:** −11.6% mean latency, −15.0% P95 latency,
-and a markedly lower worst case (max latency reduced by ~24%). The
-mechanism is visible in the raw data: `nearest` keeps sending tasks to
-whichever server is momentarily closer even after that server's queue
-has backed up, while `greedy`'s queue-length term redirects load to the
-farther-but-idle server once the near one is congested.
+**Why EFT beats the ML model.** Both make the same kind of decision (pick
+the server with the earliest finish time). The difference is how the finish
+time is estimated. EFT computes it from a formula built on how uploads and
+queues work. The ML model has to learn it from examples, and its
+predictions are less precise: on held-out data its median error is 70 ms
+versus 8 ms for EFT's formula.
 
-![Latency CDF](results/plots/latency_cdf.png)
+![Prediction accuracy of the ML model vs the EFT formula](results/plots/ml_prediction_accuracy.png)
 
-The full distribution (not just the mean) confirms `greedy`
-(green/blue) dominates `nearest` (red/orange) at essentially every
-percentile, not merely on average — the improvement isn't a few outliers
-skewing the mean.
+To be fair to the ML model: the simulator uses exactly the link and server
+equations that EFT's formula is based on, so EFT has a home advantage here.
+With real radio links and real servers, where no exact formula exists, a
+learned model could do relatively better. This benchmark does not test that
+(see [Limitations](#limitations)).
 
-![Throughput over time](results/plots/throughput_over_time.png)
+**Why the simple rules lose:** the time breakdown at 60% load shows it.
 
-All four configurations complete essentially the same cumulative task
-count over time. This is expected, not a null result: at this arrival
-rate (1.2 DAGs/s) against 2 edge servers with combined capacity 3.5×,
-the system is **latency-bound, not throughput-bound** — every dispatched
-task eventually completes regardless of policy, so the policies
-differentiate on *how long tasks wait*, not *whether* they finish. See
-[Discussion](#discussion--limitations) for what would surface a
-throughput difference.
+![Time per task by phase](results/plots/time_breakdown.png)
 
-![Speed vs latency](results/plots/speed_vs_latency.png)
+- **Nearest** has the shortest uploads but tasks wait in long queues:
+  834 ms per task on synthetic DAGs, 6.5 s on real DAGs. The slow server S0
+  is busy 96% of the time while the fast server S3 is busy only 34%.
+- **Least-loaded** avoids queues but uploads take longer (144 ms vs 113 ms
+  for EFT) because it ignores distance.
+- **EFT and ML** balance the two. ML chooses slightly closer servers
+  (102 ms uploads) but queues a little longer (43 ms vs 31 ms).
+- The ~39 ms *wait for decision tick* is the same for all policies:
+  decisions are made every 0.1 s.
+- On the real DAGs, queueing dominates for every policy. Wide workflows
+  release dozens of tasks at once, which all have to wait their turn.
 
-Link latency plotted against network-wide mean vehicle speed, across all
-runs. The scatter shows real variance driven by actual vehicle
-positions (this data could not exist without a genuine mobility
-simulation feeding it) but no strong global correlation — expected,
-since a single DAG's latency depends on *its own* owner vehicle's
-distance to each server, not the network's average speed. Included for
-transparency rather than to claim a trend that isn't there.
+![Server utilisation by policy](results/plots/server_utilisation.png)
 
-### Scheduler comparison
+### 2. Scheduler: HEFT-lite vs FIFO
 
-`HeftLiteScheduler` and `FifoScheduler` produced **statistically
-indistinguishable results** in every table and plot above. This is a
-real, honestly-reported finding: with only 2 edge servers and moderate
-load, dispatch *order* among ready tasks rarely determines which server
-a task lands on, because a server is available to receive the next task
-almost every tick regardless of ordering. The scheduler's effect would
-be expected to emerge with more servers of more varied capacity, or
-under heavier load where dispatch order determines who queues behind
-whom — see [Future Work](#future-work).
+With unlimited admission every waiting task is dispatched immediately, so
+the order only decides who is first in each server's queue. Paired by seed,
+HEFT-lite is slightly faster: by 0.3–0.6% on synthetic DAGs and up to 1.2%
+on real DAGs.
 
-## A Logging Bug Worth Documenting
+To give the scheduler more influence, the second setting limits each server
+to 5 tasks at a time (uploading, queued or running). Tasks that find no
+free server wait centrally, in the order the scheduler chooses.
 
-An earlier version of `main.cpp` computed the per-task offloading
-decision correctly, but logged a **different, contaminated** number to
-the per-tick CSV that fed `mobility_and_congestion.png`. Worth stating
-plainly rather than quietly fixing, because it's a real methodological
-pitfall:
+![HEFT-lite vs FIFO with an admission limit](results/plots/scheduler_comparison.png)
 
-`FifoResourceAllocator` exposes `link_latency_ms` as one mutable field
-per server, meant to be set externally (by the mobility layer) and read
-back for the offloading decision. That's fine with one vehicle in the
-picture, which is all the original single-DAG demo had. Once multiple
-DAGs — each "owned" by a different, moving vehicle — were dispatching
-in the same tick, the dispatch loop was doing, for *every* task: set
-that task's owner-vehicle latency into the shared field → immediately
-read it back → decide. Each individual decision was still correct,
-because the set-then-read happened back-to-back with nothing
-interleaved. But the per-tick CSV logger ran *after* the whole tick's
-dispatch loop finished, and read the same shared field — which by then
-held whichever task's owner-vehicle latency happened to be written
-*last* that tick, or, on any tick where nothing was dispatched at all,
-whatever was left over from an earlier tick. The result: a per-tick
-"link latency" column that was really a last-write-wins artifact of
-iteration order, not a meaningful measurement of anything — visible in
-the original plot as an implausible square-wave pattern instead of a
-continuous trace.
+| Load | Synthetic: HEFT-lite vs FIFO | Real DAGs: HEFT-lite vs FIFO |
+|---:|---:|---:|
+| 20% | −0.3% ± 0.2 | −0.7% ± 4.2 |
+| 40% | −0.6% ± 0.2 | +4.3% ± 2.5 |
+| 60% | +0.2% ± 0.6 | +32% ± 13 |
+| 80% | **+20% ± 8** | **+141% ± 39** |
 
-**Fix:** decisions now build their own local `ServerState` snapshot
-per task, computed fresh and never written back to shared allocator
-state (`allocator.setLinkLatency` is no longer called at all). The
-per-tick log now computes an independent **ambient** metric — mean
-latency from every vehicle currently in the simulation to each server,
-recomputed from scratch every tick regardless of dispatch activity —
-which is deterministic and has a real, checkable meaning.
+*(Change in mean makespan with the 5-task limit, paired by seed. Negative = HEFT-lite faster.)*
 
-**What this did and didn't affect:** every plot and number in
-[Results](#results) is unchanged by this fix — confirmed by re-running
-the full sweep and diffing the output (identical task counts, identical
-latency statistics to three decimal places) — because the bug never
-touched the per-task decision path or `tasks_csv`. Only
-`mobility_and_congestion.png` and `speed_vs_latency.png`, which read
-`ticks_csv`, changed, and both are more legible now: the latency trace
-is a smooth, physically sensible curve (traffic spreading across the
-grid) instead of a jumpy artifact.
+Under heavy load HEFT-lite is much worse. A newly arrived DAG's first task
+always has the highest rank (its whole DAG is still ahead of it), so new
+DAGs keep jumping ahead of the last tasks of older DAGs. Every DAG then
+takes longer, whatever its size. HEFT's ranking was designed to order the
+tasks of *one* DAG, not many DAGs competing for the same servers. The
+admission limit itself also costs time on the real DAGs: with FIFO at 80%
+load the mean makespan rises from 9.7 s (no limit) to 21.8 s.
 
-## Discussion & Limitations
+### 3. One run over time
 
-- **Latency-bound, not throughput-bound, at the tested load.** To see a
-  throughput (not just latency) difference between policies, either
-  raise `--arrival-rate` well past the servers' combined service rate,
-  or reduce server count/capacity — both are one-flag changes (see
-  [Building & Running](#building--running)).
-- **Analytic latency model, not a channel simulator.** Distance→latency
-  is a documented linear model, not SINR/interference-based. Real
-  positions in, modeled channel out — a standard and defensible
-  simplification for this scope, but not a substitute for a full network
-  simulator if that's later required.
-- **Two servers is a small action space.** It's enough to show
-  offloading policy matters; it's *not* enough to stress-test scheduler
-  ordering (see above) or more sophisticated offloading strategies
-  (e.g. predictive/lookahead policies) that only pay off with more
-  choices to reason about.
-- **TraCI subset, not full API.** `traci_client.h` implements exactly
-  the commands this project needs (simstep, vehicle id/position/speed,
-  close) — extending it (e.g. to read traffic-light state, or subscribe
-  instead of poll) means adding cases to `TraciClient`, not redesigning
-  it; the framing/status/answer decode logic is generic already.
+![Vehicles and server backlog over time](results/plots/run_timeseries.png)
 
-## Repository Structure
+Traffic builds up during the 60 s warm-up and then stays between roughly
+55 and 85 vehicles. With EFT the fast server S3 carries the most work (45%
+of all tasks at 60% load), and every server's backlog stays well under a
+second.
 
-```
-DAA_project/
-├── main.cpp                          # experiment driver (this file's entry point)
-├── run_experiment.py                 # launches SUMO + driver, handles the --sweep
-├── plot_results.py                   # generates results/plots/*.png from sweep CSVs
-├── CMakeLists.txt                    # root build config
-├── sumo_scenario/
-│   ├── grid.net.xml                  # 4x4 grid network (netgenerate)
-│   ├── routes.rou.xml                # 200 routed vehicles (randomTrips + duarouter)
-│   ├── grid.sumocfg                  # ties network + routes together
-│   └── tripinfo_test.xml             # standalone verification run output
-├── simulation/sumo_integration/
-│   ├── mobility_provider.h           # IMobilityProvider interface
-│   ├── mobility_mock.h               # synthetic mobility (fast iteration / --mock)
-│   ├── traci_client.h                # raw-socket TraCI protocol client
-│   ├── sumo_bridge.{h,cpp}           # real IMobilityProvider, via traci_client.h
-│   ├── TRACI_PROTOCOL_NOTES.md       # byte-level protocol decode, worked example
-│   └── README.md                     # module-level status and notes
-├── src/scheduling/
-│   ├── task_scheduler.h              # ITaskScheduler interface
-│   ├── heft_lite_scheduler.h         # critical-path-priority scheduler
-│   └── fifo_scheduler.h              # creation-order baseline
-├── src/offloading/
-│   ├── offloading_policy.h           # IOffloadingPolicy interface
-│   ├── greedy_latency_load_policy.h  # load + latency, weighted
-│   └── nearest_server_policy.h       # latency-only baseline
-├── src/resource_mgmt/
-│   ├── resource_allocator.h          # IResourceAllocator interface
-│   └── fifo_resource_allocator.h     # per-server FIFO queues
-└── results/
-    ├── summary.csv                   # one row per (config, seed) run
-    ├── sweep/*.csv                   # per-task and per-tick CSVs, one pair per run
-    └── plots/*.png                   # the figures shown above
-```
+---
 
-## Building & Running
+## Limitations
 
-Full details, troubleshooting, and platform-specific commands are in
-[`HOW_TO_RUN.md`](HOW_TO_RUN.md). Quick version, from the project root
-in an MSYS2 UCRT64 shell:
+These matter for interpreting the results:
+
+- **The link model is a simple formula**, not a network simulator: no
+  interference, no bandwidth shared between vehicles, no handover. Vehicle
+  positions are real (from SUMO); link quality is modelled.
+- **EFT has a home advantage over ML**, because the simulator follows the
+  same equations EFT's formula is built on. The ML baseline is also kept
+  simple: supervised learning from random exploration, with no
+  reinforcement learning and no retraining on its own decisions.
+- **The real-DAG workload is real in structure, not in scale.** The
+  WfCommons workflows are scientific computing pipelines, rescaled to
+  vehicle-sized tasks. They test the policies on realistic DAG shapes and
+  uneven task sizes; they are not recordings of vehicle applications.
+- **Tasks cannot run on the vehicle itself**, and sending results back is
+  not modelled.
+- **Each task uploads its own input from the vehicle.** Data passed between
+  dependent tasks on different servers is not modelled.
+- **Decisions happen every 0.1 s**, which adds about 39 ms per task.
+- If a vehicle leaves the map before its DAG is finished, its last known
+  position is used. This affected 2% of synthetic DAGs and 13% of real
+  DAGs on average (those take longer), and up to 44% for Nearest at 80% load.
+- **Nearest at 80% load on real DAGs left 27 DAGs unfinished** (in 3 of 10
+  runs). They are not counted in its makespan, so its real result there is
+  even worse than shown.
+- One road network and one server layout. Exact numbers depend on the
+  compiler's random-number implementation (GCC 15, MSYS2, Windows here).
+
+The first version of this project had several modelling errors (for
+example, every task finished in exactly one tick, and link latency was
+never added to task time). See [`docs/PROGRESS.md`](docs/PROGRESS.md) for
+the fixes.
+
+---
+
+## Run it yourself
+
+Step-by-step instructions for Windows, Linux and macOS are in
+**[HOW_TO_RUN.md](HOW_TO_RUN.md)**. In short:
 
 ```bash
-# one-time setup
-pip install eclipse-sumo pandas matplotlib
-
-# build
-mkdir build && cd build
-cmake -G "Ninja" .. && cmake --build .
-cd ..
-
-# single run
-python run_experiment.py --driver-bin build/iov_demo.exe \
-    --scheduler heft --offloading greedy --duration 200 \
-    --arrival-rate 1.2 --seed 1 --out-prefix results/run
-
-# full comparison sweep (what the plots above are built from)
-python run_experiment.py --driver-bin build/iov_demo.exe \
-    --sweep --sweep-seeds 1,2,3 --sweep-duration 200 --arrival-rate 1.2
-
-# regenerate the plots
-python plot_results.py
+python -m pip install -r requirements.txt     # SUMO, plotting, scikit-learn
+python data/prepare_wfcommons.py              # download the real-DAG dataset
+cmake -S . -B build && cmake --build build    # build the simulator
+python run_experiment.py                      # one run (about 3 s)
+python run_experiment.py --offloading ml      # the ML policy
+python run_experiment.py --gui                # watch it in sumo-gui
+python run_experiment.py --sweep              # all 560 runs (~6 min)
+python plot_results.py                        # the figures above
 ```
 
-## Future Work
+## Project layout
 
-- **Stress the scheduler axis:** raise arrival rate or reduce server
-  count until `HeftLiteScheduler` measurably beats `FifoScheduler`, to
-  demonstrate dispatch-order actually mattering, not just offloading
-  choice.
-- **More/heterogeneous servers:** 4+ servers with varied capacity would
-  give offloading policies (and lookahead/predictive variants) more to
-  reason about.
-- **Predictive offloading:** since vehicle trajectories are known one
-  tick at a time, a policy could extrapolate near-future position rather
-  than react to current position only — SUMO's own route data makes this
-  feasible without extra instrumentation.
-- **Richer channel model:** replace the linear distance model with
-  something SINR- or obstruction-aware, if evaluation rigor demands it.
-- **TraCI subscriptions:** switch from polling GET commands each tick to
-  TraCI's native subscription mechanism, reducing round-trip overhead
-  at higher vehicle counts.
+```
+main.cpp                    simulator driver (builds to iov_sim)
+run_experiment.py           starts SUMO + iov_sim; single runs, --gui, --sweep
+plot_results.py             figures, aggregate.csv and paired_vs_eft.csv
+visualize.py                network snapshot and animation
+src/scheduling/             HEFT-lite, FIFO, DAG workloads
+src/offloading/             EFT, Least-loaded, Nearest, ML (neural network)
+src/resource_mgmt/          edge-server queues
+simulation/sumo_integration TraCI client, SUMO bridge, mock mobility, link model
+ml/                         ML training script, trained model, training report
+data/                       script that builds the WfCommons real-DAG workload
+sumo_scenario/              SUMO network, routes, server markers, GUI settings
+tests/run_tests.cpp         unit tests (ctest)
+results/                    summary.csv, aggregate.csv, paired_vs_eft.csv, plots/
+docs/PROGRESS.md            status and list of fixes
+```

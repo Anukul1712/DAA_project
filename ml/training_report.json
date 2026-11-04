@@ -1,0 +1,64 @@
+{
+  "features": [
+    "distance_m",
+    "data_kb",
+    "workload_mcycles",
+    "cpu_capacity",
+    "pending_work_mcycles",
+    "tasks_in_system"
+  ],
+  "model": "MLPRegressor(hidden_layer_sizes=(32, 32), relu), target log1p(ms)",
+  "train_rows": 162973,
+  "test_rows": 52062,
+  "train_seeds": [
+    1001,
+    1002,
+    1003
+  ],
+  "test_seeds": [
+    1004
+  ],
+  "loads": [
+    0.2,
+    0.4,
+    0.6,
+    0.8
+  ],
+  "epochs": 119,
+  "test_ml": {
+    "mae_ms": 307.82317116547176,
+    "median_abs_error_ms": 70.10835271714103,
+    "r2": 0.9963979909739988
+  },
+  "test_eft_formula": {
+    "mae_ms": 220.7102891254658,
+    "median_abs_error_ms": 7.895999999999987,
+    "r2": 0.9977460778158534
+  },
+  "test_per_workload": {
+    "synthetic": {
+      "ml": {
+        "mae_ms": 171.0531481412952,
+        "median_abs_error_ms": 38.83062720516441,
+        "r2": 0.9989528628670789
+      },
+      "eft_formula": {
+        "mae_ms": 52.3017880110779,
+        "median_abs_error_ms": 0.0,
+        "r2": 0.9999467097872409
+      }
+    },
+    "wfcommons": {
+      "ml": {
+        "mae_ms": 460.2700831000556,
+        "median_abs_error_ms": 145.0734957523656,
+        "r2": 0.9912700986456723
+      },
+      "eft_formula": {
+        "mae_ms": 408.4221529589765,
+        "median_abs_error_ms": 42.46155000000002,
+        "r2": 0.9933303109988905
+      }
+    }
+  }
+}

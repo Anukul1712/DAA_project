@@ -1,100 +1,48 @@
-# SUMO / TraCI Simulation & Evaluation Layer
+# Mobility and SUMO integration
 
-**Owner:** Member 4
+Supplies vehicle positions to the simulator and turns distance into link
+quality.
 
-## What this module owns
+| File | What it is |
+|---|---|
+| `mobility_provider.h` | `IMobilityProvider` interface (step, vehicle positions, optional recolouring) |
+| `sumo_bridge.h/.cpp` | Real SUMO: talks to a running `sumo`/`sumo-gui` over TraCI |
+| `traci_client.h` | Small TraCI client over a plain TCP socket (Windows and POSIX) |
+| `mobility_mock.h` | Synthetic vehicles driving in a circle, for `--mock` runs without SUMO |
+| `channel_model.h` | Distance → link latency and upload rate |
+| `TRACI_PROTOCOL_NOTES.md` | Byte-level notes on the TraCI messages used |
 
-- Driving the SUMO mobility simulation over **TraCI** (SUMO's TCP
-  remote-control protocol), via a small hand-rolled C++ client
-  (`traci_client.h`) — **not libsumo**. Earlier notes here said libsumo;
-  that was the original plan, but linking libsumo's C++ library turned
-  out to be a build-environment headache (no prebuilt binary dev
-  package, only the Python wheel), so this uses the same wire protocol
-  the official Python client uses instead. It needs nothing but the
-  `sumo` binary itself — see `TRACI_PROTOCOL_NOTES.md` for the
-  byte-verified protocol decode.
-- Reading live vehicle positions each simulation step and computing
-  vehicle-to-edge-server proximity / link latency
-- Feeding that latency data into `offloading/`'s `ServerState`
-- Collecting evaluation metrics (per-task end-to-end latency, queue
-  depth, throughput) into `results/`
+## How it connects
 
-## Interface contract
+`run_experiment.py` starts SUMO with `--remote-port N`, then starts `iov_sim
+--port N`. Each tick `SumoBridge::step()` sends one *simulation step*
+command and then fetches every vehicle's position and speed in a single
+batched request. SUMO accepts exactly one TraCI client, so the runner does
+not probe the port; `TraciClient::connect` retries instead.
+
+TraCI commands implemented: simulation step, vehicle ID list, vehicle
+position, vehicle speed, set vehicle colour (for the GUI view), close.
+
+Why TraCI over a socket and not libsumo: libsumo has to be linked as a C++
+library, and the `pip install eclipse-sumo` package does not ship one that
+fits the MinGW toolchain. TraCI needs only the `sumo` program.
+
+## Channel model (an assumption, not a measurement)
 
 ```
-sumo process (via TraCI) --> vehicle positions --> latency model --> ServerState.link_latency_ms
-                                                                              |
-                                                                              v
-                                                                      (Offloading Engine)
+latency_ms  = 2 + 0.05 * distance_m
+upload_rate = 5 KB/ms / (1 + distance_m / 200)     (5 KB/ms = 40 Mbit/s)
 ```
 
-This module is the one place that talks to SUMO directly — nothing else
-in the repo should touch `traci_client.h` or the TraCI socket directly.
+It only encodes "farther away means a slower, more delayed link". It is not
+a radio or network simulator: no interference, no shadowing, no handover,
+and no sharing of bandwidth between vehicles.
 
-## Status
+## Scenario (`sumo_scenario/`)
 
-- [x] `IMobilityProvider` interface — shared by the mock feed and the
-      real bridge
-- [x] `MockMobilityProvider` — synthetic vehicles on circular paths,
-      kept around for fast iteration / `--mock` runs without SUMO
-- [x] SUMO network/route files (`sumo_scenario/grid.net.xml`,
-      `routes.rou.xml`, `grid.sumocfg`) — a 4x4 grid, 200 routed
-      vehicles, verified against real `sumo`
-- [x] `traci_client.h` — raw-socket TraCI client, byte-verified against
-      SUMO 1.27.1 (see `TRACI_PROTOCOL_NOTES.md`)
-- [x] `SumoBridge` — real `IMobilityProvider` backed by `traci_client.h`
-- [x] Baseline policies for comparison: `FifoScheduler`
-      (`src/scheduling/fifo_scheduler.h`), `NearestServerPolicy`
-      (`src/offloading/nearest_server_policy.h`)
-- [x] `main.cpp` rewritten as a continuous-arrival experiment driver
-      (random fork-join DAGs, CLI-selectable scheduler/offloading
-      policy, per-task + per-tick CSV output)
-- [x] `run_experiment.py` — launches SUMO on a free port, runs the
-      driver against it, cleans up; `--sweep` runs the full
-      scheduler x offloading x seed comparison used for the plots
-- [x] `plot_results.py` — generates the comparison plots into
-      `results/plots/`
-
-Nothing left unchecked from the original scope. Two things worth
-flagging honestly rather than hiding:
-
-- At the arrival rate used for the report plots (1.2 DAGs/s, 2 edge
-  servers), **offloading policy** (greedy load+latency vs. naive
-  nearest-server) makes a clear, consistent difference in task latency;
-  **scheduler choice** (HEFT-lite vs FIFO dispatch order) does not,
-  because with only 2 servers there's rarely real dispatch-order
-  contention to resolve. Push `--arrival-rate` higher or drop to 1
-  server if you want to see the scheduler matter too.
-- The latency model (`SumoBridge::estimateLatencyMs`) is a documented
-  analytic model (fixed overhead + distance-scaled term) on top of real
-  SUMO trajectories, not a full radio/backhaul simulator — standard
-  practice for this kind of evaluation, but worth stating plainly at
-  the mid-eval rather than implying it's a measured channel.
-
-## What to present at mid-eval
-
-- Walk through `traci_client.h` + `TRACI_PROTOCOL_NOTES.md`: this is a
-  from-scratch protocol implementation, byte-verified against the
-  official client — a defensible, explainable design decision, not a
-  black box.
-- Show `results/plots/mobility_and_congestion.png`: real vehicle count
-  ramping up as SUMO trips depart, real fluctuating link latency, real
-  (if modest, at this load) queueing — proof the whole pipeline is
-  actually driven by SUMO, not synthetic data.
-- Show `results/plots/latency_cdf.png` and `latency_by_config.png` for
-  the actual comparison result: load-aware offloading beats
-  nearest-server across the whole latency distribution, not just on
-  average.
-- `results/summary.csv` + per-run CSVs in `results/sweep/` as the raw
-  backing data.
-
-## Running it
-
-See the top-level `HOW_TO_RUN.md` for the full build + run instructions.
-
-## Setup notes
-
-Requires the `sumo` binary on `PATH`, or `SUMO_HOME` set, or the
-`eclipse-sumo` Python wheel installed (`pip install eclipse-sumo`) —
-`run_experiment.py` checks all three, in that order of preference via
-`SUMO_HOME`. No libsumo linking needed.
+- `grid.net.xml`: 4×4 grid of junctions, 200 m blocks, 600 m × 600 m (made with `netgenerate`).
+- `routes.rou.xml`: 500 random trips, one departure per second over 0–500 s
+  (`randomTrips.py --seed 7 -p 1.0 --fringe-factor 5 --validate`). About 75
+  vehicles are on the road at the same time once traffic has built up.
+- `servers.add.xml`: the four edge servers, drawn as coloured circles in sumo-gui.
+- `gui-settings.xml`: view settings used by `run_experiment.py --gui`.

@@ -1,71 +1,115 @@
 #pragma once
+#include <algorithm>
 #include <deque>
-#include <unordered_map>
+#include <map>
+#include <stdexcept>
+#include <vector>
 #include "resource_allocator.h"
 
 namespace iov::resource_mgmt {
 
-struct ServerSpec {
-    uint64_t server_id;
-    double cpu_capacity;  // work units processed per ms
-};
-
-// Concrete, working allocator: one FIFO queue per server. Each tick(),
-// the head-of-line task on every server gets cpu_capacity * dt of work
-// done; when its remaining_workload hits zero it's popped and reported
-// as completed. This directly models "dynamic queue congestion" and
-// "heterogeneous resources" from the objective — congestion because
-// queue_length is just deque size, heterogeneity because each server
-// has its own cpu_capacity.
+// One FIFO queue per server, simulated exactly (event by event) rather
+// than in whole ticks:
+//   - A job is "uploading" until its data_ready_ms, then joins the queue.
+//   - Queued jobs run one at a time in the order their data arrived.
+//   - Work is done at cpu_capacity mega-cycles per ms. When a job
+//     finishes mid-tick, the rest of the tick goes to the next job.
+//   - Finish times are exact, so results are not rounded to tick length.
 class FifoResourceAllocator : public IResourceAllocator {
 public:
-    explicit FifoResourceAllocator(std::vector<ServerSpec> servers) {
-        for (const auto& s : servers) {
-            specs_[s.server_id] = s;
-            queues_[s.server_id] = {};
-            link_latency_ms_[s.server_id] = 0.0;
+    explicit FifoResourceAllocator(const std::vector<ServerSpec>& specs) {
+        for (const auto& s : specs) {
+            if (s.cpu_capacity <= 0.0) throw std::invalid_argument("cpu_capacity must be > 0");
+            servers_[s.server_id].spec = s;
         }
     }
 
-    void admit(uint64_t server_id, const QueueEntry& entry) override {
-        queues_[server_id].push_back(entry);
+    void admit(uint64_t server_id, const Job& job) override {
+        auto& srv = servers_.at(server_id);
+        // Keep uploads sorted by arrival time so they enter the queue in order.
+        auto pos = std::upper_bound(srv.uploading.begin(), srv.uploading.end(), job,
+                                    [](const Job& a, const Job& b) {
+                                        return a.data_ready_ms < b.data_ready_ms;
+                                    });
+        srv.uploading.insert(pos, job);
     }
 
-    // Optional: let the mobility layer push in latency estimates so
-    // currentState() reflects live conditions.
-    void setLinkLatency(uint64_t server_id, double latency_ms) {
-        link_latency_ms_[server_id] = latency_ms;
+    std::vector<Completion> advanceTo(double now_ms) override {
+        std::vector<Completion> done;
+        for (auto& [id, srv] : servers_) runServer(id, srv, now_ms, done);
+        std::sort(done.begin(), done.end(),
+                  [](const Completion& a, const Completion& b) { return a.finish_ms < b.finish_ms; });
+        return done;
     }
 
-    std::vector<uint64_t> tick(double dt_ms) override {
-        std::vector<uint64_t> completed;
-        for (auto& [server_id, q] : queues_) {
-            if (q.empty()) continue;
-            double capacity = specs_[server_id].cpu_capacity;
-            q.front().remaining_workload -= capacity * dt_ms;
-            if (q.front().remaining_workload <= 0.0) {
-                completed.push_back(q.front().task_id);
-                q.pop_front();
-            }
-        }
-        return completed;
-    }
-
-    std::vector<iov::offloading::ServerState> currentState() const override {
+    std::vector<iov::offloading::ServerState> state() const override {
         std::vector<iov::offloading::ServerState> out;
-        for (const auto& [server_id, spec] : specs_) {
-            out.push_back({server_id,
-                            static_cast<double>(queues_.at(server_id).size()),
-                            spec.cpu_capacity,
-                            link_latency_ms_.at(server_id)});
+        for (const auto& [id, srv] : servers_) {
+            double pending = 0.0;
+            for (const auto& j : srv.uploading) pending += j.workload_mcycles;
+            for (const auto& q : srv.queue) pending += q.remaining;
+            out.push_back({id, srv.spec.cpu_capacity,
+                           static_cast<int>(srv.uploading.size() + srv.queue.size()), pending});
         }
         return out;
     }
 
+    // Total time each server spent executing (for utilisation).
+    double busyMs(uint64_t server_id) const { return servers_.at(server_id).busy_ms; }
+
 private:
-    std::unordered_map<uint64_t, ServerSpec> specs_;
-    std::unordered_map<uint64_t, std::deque<QueueEntry>> queues_;
-    std::unordered_map<uint64_t, double> link_latency_ms_;
+    struct Running {
+        Job job;
+        double remaining;
+        double start_ms = -1.0;  // -1 = not started yet
+    };
+    struct Server {
+        ServerSpec spec;
+        std::vector<Job> uploading;  // sorted by data_ready_ms
+        std::deque<Running> queue;   // data has arrived; front is running
+        double clock_ms = 0.0;       // how far this server has been simulated
+        double busy_ms = 0.0;
+    };
+
+    static void moveArrived(Server& srv, double t) {
+        size_t n = 0;
+        while (n < srv.uploading.size() && srv.uploading[n].data_ready_ms <= t) {
+            const Job& j = srv.uploading[n];
+            srv.queue.push_back({j, j.workload_mcycles});
+            ++n;
+        }
+        srv.uploading.erase(srv.uploading.begin(), srv.uploading.begin() + static_cast<long>(n));
+    }
+
+    static void runServer(uint64_t id, Server& srv, double end_ms, std::vector<Completion>& done) {
+        double t = srv.clock_ms;
+        while (t < end_ms) {
+            moveArrived(srv, t);
+            if (srv.queue.empty()) {
+                // Idle: jump to the next upload arrival, or to the end.
+                if (srv.uploading.empty() || srv.uploading.front().data_ready_ms >= end_ms) break;
+                t = srv.uploading.front().data_ready_ms;
+                continue;
+            }
+            Running& head = srv.queue.front();
+            if (head.start_ms < 0.0) head.start_ms = t;
+            double finish = t + head.remaining / srv.spec.cpu_capacity;
+            if (finish <= end_ms) {
+                srv.busy_ms += finish - t;
+                done.push_back({head.job.task_id, id, head.start_ms, finish});
+                srv.queue.pop_front();
+                t = finish;
+            } else {
+                srv.busy_ms += end_ms - t;
+                head.remaining -= (end_ms - t) * srv.spec.cpu_capacity;
+                t = end_ms;
+            }
+        }
+        srv.clock_ms = std::max(srv.clock_ms, end_ms);
+        moveArrived(srv, srv.clock_ms);
+    }
+
+    std::map<uint64_t, Server> servers_;  // ordered -> deterministic iteration
 };
 
 }  // namespace iov::resource_mgmt

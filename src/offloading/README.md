@@ -1,40 +1,31 @@
-# Edge Server Selection / Offloading Engine
+# Offloading (which server)
 
-**Owner:** Member 2
+Decides **which edge server runs a task**. It gets the task plus, for every
+server that can accept it, the server's state (capacity, backlog) and the
+link from the task's vehicle to that server (latency, upload rate).
 
-## What this module owns
+| File | Policy | Looks at |
+|---|---|---|
+| `eft_policy.h` | **EFT** – earliest estimated finish time | distance *and* load *and* server speed |
+| `least_loaded_policy.h` | **Least-loaded** baseline – shortest backlog (in ms) | load only |
+| `nearest_server_policy.h` | **Nearest** baseline – lowest link latency | distance only |
+| `mlp_policy.h` | **ML** baseline – a small neural network predicts each server's finish time ([details](../../ml/README.md)) | learned from data |
+| `mlp_policy.h` | **Random** – uniform choice; only used to collect ML training data | nothing |
+| `offloading_policy.h` | Shared types, `IOffloadingPolicy` interface, `estimatedFinishMs()` | |
 
-- For each ready task (handed off by `scheduling/`), decide: execute
-  locally, or offload — and if offloading, to which edge server
-- Uses live server state (queue length, load) from `resource_mgmt/` and,
-  once wired up, live proximity/latency data from `simulation/` (SUMO)
-- Swappable offloading policy via the `IOffloadingPolicy` Strategy
-  interface (e.g. nearest-server, least-loaded, latency-aware greedy)
-
-## Interface contract
+EFT's estimate, all in milliseconds:
 
 ```
-(Scheduling Core) --ordered tasks--> IOffloadingPolicy --assignment--> (Resource Manager)
-                                            ^
-                                            | queue/load state, vehicle position
-                                            (Resource Manager, SUMO bridge)
+upload  = link_latency + data_kb / upload_rate
+backlog = pending_work / capacity
+finish  = max(upload, backlog) + workload / capacity
 ```
 
-## Status
+Upload and the server's existing backlog overlap in time, hence the `max`.
 
-- [x] `IOffloadingPolicy` interface defined
-- [x] Concrete policy implemented: `GreedyLatencyLoadPolicy`
-      (`greedy_latency_load_policy.h`) — scores each server by
-      `queue_length / cpu_capacity + latency_weight * link_latency_ms`,
-      picks the minimum
-- [x] Wired to receive tasks from `scheduling/` (via `main.cpp`)
-- [x] Wired to query `resource_mgmt/` for live server state
-- [ ] Baseline policy (e.g. nearest-server-only) to compare against
-- [ ] `latency_weight` tuned/justified rather than a placeholder default
+Not modelled: executing a task on the vehicle itself, and downloading the
+result back to the vehicle (assumed small).
 
-## What to present at mid-eval
-
-- The scoring rule and why it captures "joint" congestion + proximity
-  optimization from the objective
-- That it's already consuming live queue state from `resource_mgmt/` and
-  live (currently mocked) latency from `simulation/`
+Tests: `tests/run_tests.cpp` checks that, for a close-but-busy server versus
+a far-but-idle fast server, Nearest picks the first while Least-loaded and EFT
+pick the second, and that the EFT estimate is computed exactly.

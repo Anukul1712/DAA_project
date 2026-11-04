@@ -1,41 +1,43 @@
-# Progress Tracker — Mid Evaluation
+# Progress
 
-| Component | Owner | Status | What's done | What's next |
-|---|---|---|---|---|
-| DAG Scheduling Core | Member 1 | 🟡 Working v1 | `ITaskScheduler` interface + `HeftLiteScheduler` (upward-rank priority) implemented and running in the end-to-end demo | Add a second policy for comparison (e.g. plain FIFO) to show the Strategy pattern actually matters; unit tests on a hand-built DAG |
-| Offloading Engine | Member 2 | 🟡 Working v1 | `IOffloadingPolicy` interface + `GreedyLatencyLoadPolicy` (load + latency scoring) implemented and running | Tune/justify `latency_weight`; add a naive baseline (nearest-server-only) to compare against |
-| Resource & Queue Manager | Member 3 | 🟡 Working v1 | `IResourceAllocator` interface + `FifoResourceAllocator` (per-server FIFO queue, heterogeneous capacity) implemented and running | Add a priority-queue variant; expose queue-length-over-time for a congestion plot |
-| SUMO/TraCI Integration | Member 4 | 🟡 Mocked, real integration pending | `IMobilityProvider` interface + `MockMobilityProvider` (synthetic vehicle motion, distance-based latency model) implemented and feeding the demo | Swap in real `SumoBridge` (libsumo) — interface is already in place, this is a drop-in replacement, not a redesign |
+| Component | Owner | Status |
+|---|---|---|
+| DAG scheduling (`src/scheduling/`) | Member 1 | Done: HEFT-lite (upward rank) and FIFO, random DAG generator, unit tests |
+| Offloading (`src/offloading/`) | Member 2 | Done: EFT, Least-loaded, Nearest and an ML (neural-network) baseline, unit tests |
+| Server queues (`src/resource_mgmt/`) | Member 3 | Done: exact (event-accurate) FIFO servers with upload phase, unit tests |
+| SUMO / TraCI (`simulation/sumo_integration/`) | Member 4 | Done: TraCI client, SUMO bridge, mock feed, channel model, sumo-gui colouring |
 
-**Overall: core pipeline is implemented and runs end-to-end** (`main.cpp` ->
-`./demo`), producing real per-task completion times and a makespan — see
-`results/demo_run.csv`. The one deliberately-deferred piece is swapping
-the mock mobility feed for real libsumo; everything downstream of it
-already works against that interface, so it's a scoped, well-isolated
-remaining task rather than a blocker.
+## Integration
 
-## Integration status
+- [x] Scheduling → offloading → server queues wired together in `main.cpp`
+- [x] Real SUMO vehicle positions drive every offloading decision and every upload time
+- [x] Experiment runner (`run_experiment.py`) with single runs, `--gui`, `--mock` and `--sweep`
+- [x] Figures (`plot_results.py`) and network visualisation (`visualize.py`)
+- [x] Unit tests (`build/iov_tests`, run with `ctest`)
+- [x] Real-DAG workload from the public WfCommons dataset (`data/`)
+- [x] ML benchmark: neural-network offloading policy trained on simulator data (`ml/`)
 
-- [x] Scheduling -> Offloading interface wired up
-- [x] Offloading -> Resource Manager interface wired up
-- [ ] SUMO feeding live vehicle/latency data into Offloading Engine (currently mocked)
-- [x] First end-to-end run completed
-- [x] Baseline completion-time metric captured (see `results/demo_run.csv`)
+## Changes after the first review
 
-## Mid-eval talking points
+The first version had modelling problems that made its results unreliable.
+They are fixed, and all results were regenerated:
 
-1. **Problem restated in one line:** Given a DAG of tasks, decide execution
-   order, which edge server each task runs on, and how it's queued —
-   jointly, under congestion and heterogeneous capacity — to minimize
-   total completion time.
-2. **What's runnable today (demo-able):** `./demo` builds a 5-task
-   fork-join DAG, schedules it via upward-rank priority, offloads each
-   task to one of two heterogeneous servers using a load+latency score,
-   executes it through per-server FIFO queues, and reports per-task
-   completion times and total makespan.
-3. **Biggest technical risk / open question:** Real libsumo integration —
-   build/link setup and getting realistic latency numbers from actual
-   vehicle trajectories instead of the placeholder distance model.
-4. **Next milestone (post mid-eval):** Replace `MockMobilityProvider`
-   with `SumoBridge`; add a second policy per module so we can compare
-   against a baseline and show the joint-optimization actually helps.
+| Problem | Fix |
+|---|---|
+| Every task finished in exactly one tick (work per tick > largest task, leftover capacity thrown away), so server speed made no difference | Servers are simulated exactly; leftover time goes to the next task; workloads now take tens to hundreds of ms |
+| Link latency only influenced the choice and was never added to task time; `data_size` was unused | Every task now pays an upload time (latency + data / distance-dependent rate) |
+| All ready tasks were dispatched immediately, so the scheduler could not matter | Global waiting list across DAGs, plus an optional per-server admission limit (`--server-slots`) |
+| Finish times were stamped one tick early (some tasks took 0 s) | Exact finish times from the server simulation |
+| "Task latency" was measured from DAG arrival | Main metric is now DAG makespan, plus a per-task time breakdown |
+| Greedy score added `queue / capacity` to `0.3 × ms` (mismatched units) | Replaced by EFT, which estimates everything in ms |
+| Completion ratio was always 1 by construction | Unfinished DAGs are counted and reported |
+| 3 seeds, no error bars | 10 seeds, 95% confidence intervals, paired comparisons || TraCI extended-length field was off by one byte | Fixed and unit-tested |
+| Docs and build names out of date (`iov_demo` vs `experiment_driver`, libsumo, "mocked") | One program (`iov_sim`), docs rewritten |
+
+## Possible next steps
+
+- Executing tasks locally on the vehicle as an extra option
+- A multi-DAG-aware scheduler (e.g. smallest remaining DAG first), since
+  HEFT-lite's critical-path order is not designed for many competing DAGs
+- A richer channel model (shared bandwidth, interference, handover)
+- TraCI subscriptions instead of polling, for larger networks

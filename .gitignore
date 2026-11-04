@@ -1,9 +1,24 @@
+# build output
 build/
 *.o
 *.obj
 *.exe
-.vscode/
-.idea/
-*.xml.bak
 CMakeFiles/
 CMakeCache.txt
+
+# editor
+.vscode/
+.idea/
+
+# large / regenerable experiment output (summary.csv, aggregate.csv and plots are kept)
+results/sweep/
+results/run_*.csv
+results/viz_*.csv
+results/tmp_*/
+__pycache__/
+*.xml.bak
+
+# downloaded dataset (LGPL-3.0, fetched by data/prepare_wfcommons.py) and ML training data
+data/wfinstances/
+data/wfcommons_dags.csv
+ml/data/
