@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Scenario 'city': 8x8 grid, 250 m blocks. The experiment driver
+     controls the clock over TraCI, so no end time is set here. -->
+<configuration>
+    <input>
+        <net-file value="grid.net.xml"/>
+        <route-files value="routes.rou.xml"/>
+        <additional-files value="servers.add.xml"/>
+    </input>
+    <time>
+        <step-length value="0.1"/>
+    </time>
+    <processing>
+        <time-to-teleport value="300"/>
+    </processing>
+    <report>
+        <no-step-log value="true"/>
+        <no-warnings value="true"/>
+    </report>
+    <random_number>
+        <seed value="42"/>
+    </random_number>
+</configuration>

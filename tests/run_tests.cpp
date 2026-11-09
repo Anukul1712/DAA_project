@@ -18,6 +18,7 @@
 #include "src/scheduling/dag_generator.h"
 #include "src/scheduling/fifo_scheduler.h"
 #include "src/scheduling/heft_lite_scheduler.h"
+#include "src/scheduling/srpt_dag_scheduler.h"
 
 using namespace iov;
 
@@ -113,6 +114,49 @@ static void testAllocatorQueueOrderIsUploadOrder() {
     CHECK(done[0].task_id == 2);
     CHECK_NEAR(done[0].finish_ms, 15.0);
     CHECK_NEAR(done[1].finish_ms, 40.0);
+}
+
+static void testPriorityDiscipline() {
+    using namespace iov::resource_mgmt;
+    QueueResourceAllocator a({{0, 1.0}}, Discipline::Priority);
+    a.admit(0, {1, 10.0, 0.0, 5.0});  // starts first (only one there at t=0)
+    a.admit(0, {2, 10.0, 1.0, 9.0});  // low priority
+    a.admit(0, {3, 10.0, 2.0, 1.0});  // high priority, arrives last
+    auto done = a.advanceTo(100.0);
+    CHECK(done.size() == 3);
+    CHECK(done[0].task_id == 1);  // non-preemptive: the running job finishes first
+    CHECK(done[1].task_id == 3);  // then the most urgent queued job
+    CHECK_NEAR(done[1].finish_ms, 20.0);
+    CHECK(done[2].task_id == 2);
+    CHECK_NEAR(done[2].finish_ms, 30.0);
+}
+
+static void testStateForCountsOnlyWorkAhead() {
+    using namespace iov::resource_mgmt;
+    QueueResourceAllocator prio({{0, 1.0}}, Discipline::Priority);
+    QueueResourceAllocator fifo({{0, 1.0}}, Discipline::Fifo);
+    for (auto* a : {&prio, &fifo}) {
+        a->admit(0, {1, 100.0, 50.0, 1.0});
+        a->admit(0, {2, 200.0, 50.0, 8.0});
+    }
+    CHECK_NEAR(prio.stateFor(5.0)[0].pending_work_mcycles, 100.0);  // only job 1 is ahead
+    CHECK_NEAR(fifo.stateFor(5.0)[0].pending_work_mcycles, 300.0);  // FIFO: everything is ahead
+    CHECK_NEAR(prio.state()[0].pending_work_mcycles, 300.0);
+}
+
+static void testSrptPriority() {
+    iov::scheduling::SrptDagScheduler s(1.0, 1.0);
+    iov::scheduling::Dag big, small;
+    big.id = 1;
+    big.tasks = {{10, {}, 500, 0}, {11, {10}, 500, 0}};
+    small.id = 2;
+    small.tasks = {{20, {}, 100, 0}};
+    s.onDagArrival(big);
+    s.onDagArrival(small);
+    auto o = s.order({{10, 1, 0.0}, {20, 2, 0.5}});
+    CHECK(o[0].task_id == 20);  // the DAG with less remaining work goes first
+    s.onTaskFinished(1, big.tasks[0]);
+    CHECK_NEAR(s.remainingWork(1), 500.0);
 }
 
 // ---------------------------------------------------------------- schedulers
@@ -233,6 +277,9 @@ int main() {
         {"allocator work spans ticks", testAllocatorWorkSpansTicks},
         {"allocator waits for upload", testAllocatorWaitsForUpload},
         {"allocator queue order", testAllocatorQueueOrderIsUploadOrder},
+        {"priority server discipline", testPriorityDiscipline},
+        {"priority-aware backlog", testStateForCountsOnlyWorkAhead},
+        {"dag-srpt priority", testSrptPriority},
         {"heft ranks", testHeftRanks},
         {"fifo order", testFifoOrder},
         {"offloading policies", testPolicies},

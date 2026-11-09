@@ -1,0 +1,5 @@
+queue,predictor,tasks,median_abs_error_ms,mean_abs_error_ms,r2
+fifo,ML (neural net),9839,72.34,240.573,0.723
+fifo,EFT formula,9839,45.88,119.513,0.958
+priority,ML (neural net),10161,88.131,465.785,0.188
+priority,EFT formula,10161,99.21,578.77,0.115

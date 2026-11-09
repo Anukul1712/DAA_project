@@ -15,6 +15,7 @@ struct Job {
     uint64_t task_id = 0;
     double workload_mcycles = 0.0;
     double data_ready_ms = 0.0;  // absolute time the upload finishes; job can't start before this
+    double priority = 0.0;       // lower = served first (used by the priority discipline)
 };
 
 // Reported when a job finishes.
@@ -25,7 +26,7 @@ struct Completion {
     double finish_ms = 0.0;  // exact finish time (not rounded to a tick)
 };
 
-// Strategy interface for per-server queueing/execution.
+// Strategy interface for per-server queueing/execution (resource allocation).
 class IResourceAllocator {
 public:
     virtual ~IResourceAllocator() = default;
@@ -37,8 +38,12 @@ public:
     // jobs that finished, with exact finish times.
     virtual std::vector<Completion> advanceTo(double now_ms) = 0;
 
-    // Snapshot for offloading decisions.
+    // Snapshot of all servers (pending work = everything not yet done).
     virtual std::vector<iov::offloading::ServerState> state() const = 0;
+
+    // Snapshot as seen by a NEW job with the given priority: pending work
+    // counts only the work that would be served before it.
+    virtual std::vector<iov::offloading::ServerState> stateFor(double priority) const = 0;
 };
 
 }  // namespace iov::resource_mgmt

@@ -1,4 +1,5 @@
 #pragma once
+#include <algorithm>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -29,20 +30,36 @@ struct ReadyTask {
     double ready_time_s = 0.0;  // when its last dependency finished (or DAG arrival)
 };
 
-// Strategy interface: decides the order in which waiting tasks (from all
-// DAGs) get a chance to be dispatched. Order matters whenever there are
-// more waiting tasks than free server slots.
+// Strategy interface. A scheduler assigns every ready task a PRIORITY
+// (lower = more urgent). The priority is used twice:
+//   1. to order waiting tasks for dispatch (order()), and
+//   2. by servers with the "priority" queue discipline, to pick which
+//      queued task gets the CPU next (resource allocation).
 class ITaskScheduler {
 public:
     virtual ~ITaskScheduler() = default;
     virtual std::string name() const = 0;
 
-    // Hooks so a policy can precompute per-DAG data (e.g. ranks).
     virtual void onDagArrival(const Dag& /*dag*/) {}
+    virtual void onTaskFinished(int /*dag_id*/, const Task& /*task*/) {}
     virtual void onDagFinished(const Dag& /*dag*/) {}
 
-    // Returns the waiting tasks in the order they should be dispatched.
-    virtual std::vector<ReadyTask> order(std::vector<ReadyTask> ready) = 0;
+    // Priority of a ready task right now (lower = served first).
+    virtual double priority(const ReadyTask& t) const = 0;
+
+    // Waiting tasks in dispatch order: by priority, then ready time, then id.
+    virtual std::vector<ReadyTask> order(std::vector<ReadyTask> ready) {
+        std::vector<std::pair<double, ReadyTask>> keyed;
+        keyed.reserve(ready.size());
+        for (const auto& r : ready) keyed.push_back({priority(r), r});
+        std::sort(keyed.begin(), keyed.end(), [](const auto& a, const auto& b) {
+            if (a.first != b.first) return a.first < b.first;
+            if (a.second.ready_time_s != b.second.ready_time_s) return a.second.ready_time_s < b.second.ready_time_s;
+            return a.second.task_id < b.second.task_id;
+        });
+        for (size_t i = 0; i < keyed.size(); ++i) ready[i] = keyed[i].second;
+        return ready;
+    }
 };
 
 }  // namespace iov::scheduling

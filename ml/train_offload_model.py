@@ -7,8 +7,11 @@
    real time from dispatch to finish:
        distance_m, data_kb, workload_mcycles, cpu_capacity,
        pending_work_mcycles, tasks_in_system   ->  actual_ms
-   Training runs use seeds 1001-1004, which are never used in the
-   evaluation (seeds 1-10), on both workloads and at 4 load levels.
+   Data comes from the city scenario (16 servers), both workloads, 6 load
+   levels (20-95%), and both server queue disciplines (FIFO, and DAG-SRPT
+   priorities with priority queues). Seeds 1001-1004 are used, which are
+   never used in the evaluation (seeds 1-10). At most 6000 tasks are kept
+   per run so that every setting is equally represented.
 2. Train an MLP regressor (2 hidden layers of 32 ReLU units, scikit-learn)
    to predict log(1 + actual_ms). The model is never shown the link
    latency/rate formula or the EFT estimate.
@@ -35,7 +38,9 @@ FEATURES = ["distance_m", "data_kb", "workload_mcycles", "cpu_capacity",
             "pending_work_mcycles", "tasks_in_system"]
 TRAIN_SEEDS = [1001, 1002, 1003]
 TEST_SEEDS = [1004]
-LOADS = [0.2, 0.4, 0.6, 0.8]
+LOADS = [0.2, 0.4, 0.6, 0.8, 0.9, 0.95]
+MODES = [("fifo", "fifo"), ("srpt", "priority")]  # (scheduler, server queue)
+ROWS_PER_RUN = 6000
 DATA_DIR = os.path.join(HERE, "data")
 MODEL_PATH = os.path.join(HERE, "offload_mlp.txt")
 REPORT_PATH = os.path.join(HERE, "training_report.json")
@@ -47,17 +52,22 @@ def collect(jobs_parallel):
     jobs = []
     for wl in rx.WORKLOADS:
         for load in LOADS:
-            for seed in TRAIN_SEEDS + TEST_SEEDS:
-                prefix = os.path.relpath(os.path.join(DATA_DIR, f"{wl}_u{load:g}_s{seed}"), REPO_ROOT)
-                jobs.append(dict(out_prefix=prefix, label="random", offloading="random", workload=wl,
-                                 load=load, seed=seed, extra=["--light", "--log-decisions"]))
+            for sch, q in MODES:
+                for seed in TRAIN_SEEDS + TEST_SEEDS:
+                    prefix = os.path.relpath(os.path.join(DATA_DIR, f"{wl}_{q}_u{load:g}_s{seed}"), REPO_ROOT)
+                    jobs.append(dict(out_prefix=prefix, label="random", scenario="city", scheduler=sch,
+                                     server_queue=q, offloading="random", workload=wl, load=load, seed=seed,
+                                     warmup=rx.WARMUP["city"], extra=["--light", "--log-decisions"]))
     print(f"Collecting training data: {len(jobs)} runs with random offloading...", flush=True)
-    rx.run_many(driver, sumo, jobs, jobs_parallel, progress_every=8)
+    rx.run_many(driver, sumo, jobs, jobs_parallel, progress_every=16)
     frames = []
     for j in jobs:
-        df = pd.read_csv(os.path.join(REPO_ROOT, j["out_prefix"] + "_decisions.csv"))
-        df["workload"], df["load"], df["seed"] = j["workload"], j["load"], j["seed"]
+        path = os.path.join(REPO_ROOT, j["out_prefix"] + "_decisions.csv")
+        df = pd.read_csv(path)
+        df = df.sample(min(ROWS_PER_RUN, len(df)), random_state=j["seed"])
+        df["workload"], df["load"], df["seed"], df["queue"] = j["workload"], j["load"], j["seed"], j["server_queue"]
         frames.append(df)
+        os.remove(path)  # the raw logs are large; the sampled rows are cached below
     return pd.concat(frames, ignore_index=True)
 
 

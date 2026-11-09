@@ -10,7 +10,7 @@ link from the task's vehicle to that server (latency, upload rate).
 | `least_loaded_policy.h` | **Least-loaded** baseline – shortest backlog (in ms) | load only |
 | `nearest_server_policy.h` | **Nearest** baseline – lowest link latency | distance only |
 | `mlp_policy.h` | **ML** baseline – a small neural network predicts each server's finish time ([details](../../ml/README.md)) | learned from data |
-| `mlp_policy.h` | **Random** – uniform choice; only used to collect ML training data | nothing |
+| `mlp_policy.h` | **Random** – random server, probability proportional to its speed; only used to collect ML training data | nothing |
 | `offloading_policy.h` | Shared types, `IOffloadingPolicy` interface, `estimatedFinishMs()` | |
 
 EFT's estimate, all in milliseconds:

@@ -25,7 +25,6 @@ from matplotlib.animation import FuncAnimation, PillowWriter
 from matplotlib.patches import Circle
 
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
-SERVER_COLORS = ["#2a78d6", "#eb6834", "#1baf7a", "#6250d6"]
 IDLE = "#b5b3ad"
 ROAD = "#8f8d87"
 BG = "#fcfcfb"
@@ -42,20 +41,29 @@ def road_shapes(net_path):
     return shapes
 
 
+def server_color(s):
+    return (s.r / 255.0, s.g / 255.0, s.b / 255.0)
+
+
 def draw_base(ax, roads, servers):
     ax.set_facecolor(BG)
+    xmax = max(max(x for x, _ in pts) for pts in roads)
+    ymax = max(max(y for _, y in pts) for pts in roads)
+    scale = max(xmax, ymax) / 600.0  # marker sizes relative to the small 600 m map
+    lw = 2.2 if scale < 2 else 1.2
     for pts in roads:
         xs, ys = zip(*pts)
-        ax.plot(xs, ys, color=ROAD, linewidth=2.2, solid_capstyle="round", zorder=1)
+        ax.plot(xs, ys, color=ROAD, linewidth=lw, solid_capstyle="round", zorder=1)
     for _, s in servers.iterrows():
-        color = SERVER_COLORS[int(s.server_id) % len(SERVER_COLORS)]
-        ax.add_patch(Circle((s.x, s.y), 28, color=color, alpha=0.25, zorder=2, linewidth=0))
-        ax.add_patch(Circle((s.x, s.y), 9, color=color, zorder=4))
-        ax.annotate(f"{s['name']}  {s.cpu_capacity:g} Mcycles/ms", (s.x, s.y), xytext=(0, -34),
-                    textcoords="offset points", ha="center", fontsize=8, color="#0b0b0b", zorder=5,
-                    bbox=dict(boxstyle="round,pad=0.2", fc=BG, ec="none", alpha=0.9))
-    ax.set_xlim(-40, 640)
-    ax.set_ylim(-40, 640)
+        color = server_color(s)
+        ax.add_patch(Circle((s.x, s.y), 28 * scale, color=color, alpha=0.25, zorder=2, linewidth=0))
+        ax.add_patch(Circle((s.x, s.y), 9 * scale, color=color, zorder=4))
+        ax.annotate(f"{s['name']} ({s.cpu_capacity:g})", (s.x, s.y), xytext=(0, -20 if scale > 2 else -34),
+                    textcoords="offset points", ha="center", fontsize=7 if scale > 2 else 8,
+                    color="#0b0b0b", zorder=5, bbox=dict(boxstyle="round,pad=0.2", fc=BG, ec="none", alpha=0.9))
+    pad = 40 * scale
+    ax.set_xlim(-pad, xmax + pad)
+    ax.set_ylim(-pad, ymax + pad)
     ax.set_aspect("equal")
     ax.set_xticks([])
     ax.set_yticks([])
@@ -63,14 +71,15 @@ def draw_base(ax, roads, servers):
         sp.set_visible(False)
 
 
-def colors_for(frame):
-    return [IDLE if sid < 0 else SERVER_COLORS[int(sid) % len(SERVER_COLORS)] for sid in frame.server_id]
+def colors_for(frame, servers):
+    lut = {int(s.server_id): server_color(s) for _, s in servers.iterrows()}
+    return [IDLE if sid < 0 else lut[int(sid)] for sid in frame.server_id]
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--run", default=os.path.join("results", "viz"), help="out-prefix of the run")
-    ap.add_argument("--net", default=os.path.join("sumo_scenario", "grid.net.xml"))
+    ap.add_argument("--net", default=os.path.join("sumo_scenario", "city", "grid.net.xml"))
     ap.add_argument("--snapshot-time", type=float, default=200.0)
     ap.add_argument("--gif-start", type=float, default=150.0)
     ap.add_argument("--gif-seconds", type=float, default=30.0)
@@ -97,10 +106,11 @@ def main():
     fig, ax = plt.subplots(figsize=(6.4, 6.8))
     fig.patch.set_facecolor(BG)
     draw_base(ax, roads, servers)
-    ax.scatter(f.x, f.y, s=34, c=colors_for(f), edgecolors=BG, linewidths=1.2, zorder=3)
+    ax.scatter(f.x, f.y, s=14, c=colors_for(f, servers), edgecolors=BG, linewidths=0.6, zorder=3)
     busy = int((f.server_id >= 0).sum())
     ax.set_title(f"SUMO grid at t = {t:.0f} s: {len(f)} vehicles, {busy} with tasks offloaded\n"
-                 "vehicle colour = server running its tasks, grey = no tasks", fontsize=10, loc="left")
+                 "vehicle colour = speed class of the server running its tasks, grey = none\n"
+                 "server speeds (Mcycles/ms): blue 2, orange 3, green 4, violet 6", fontsize=9, loc="left")
     fig.tight_layout()
     fig.savefig(os.path.join(out_dir, "network_snapshot.png"), dpi=150)
     plt.close(fig)
@@ -111,13 +121,13 @@ def main():
         fig, ax = plt.subplots(figsize=(5.2, 5.6))
         fig.patch.set_facecolor(BG)
         draw_base(ax, roads, servers)
-        dots = ax.scatter([], [], s=30, edgecolors=BG, linewidths=1.0, zorder=3)
+        dots = ax.scatter([], [], s=10, edgecolors=BG, linewidths=0.5, zorder=3)
         title = ax.set_title("", fontsize=10, loc="left")
 
         def update(tt):
             g = pos[pos.time_s == tt]
             dots.set_offsets(g[["x", "y"]].values)
-            dots.set_facecolors(colors_for(g))
+            dots.set_facecolors(colors_for(g, servers))
             title.set_text(f"t = {tt:5.1f} s   vehicles: {len(g)}   with tasks: {int((g.server_id >= 0).sum())}")
             return dots, title
 

@@ -137,8 +137,9 @@ private:
     MlpModel model_;
 };
 
-// Uniformly random server. Used only to collect unbiased training data
-// for the ML model (it explores every server in every situation).
+// Random server, chosen with probability proportional to its CPU capacity
+// (so slow servers are not overloaded). Used only to collect training data
+// for the ML model: it explores every server in every situation.
 class RandomPolicy : public IOffloadingPolicy {
 public:
     explicit RandomPolicy(unsigned seed) : rng_(seed) {}
@@ -146,7 +147,9 @@ public:
     std::optional<uint64_t> choose(const iov::scheduling::Task& /*task*/,
                                    const std::vector<Candidate>& candidates) override {
         if (candidates.empty()) return std::nullopt;
-        std::uniform_int_distribution<size_t> pick(0, candidates.size() - 1);
+        std::vector<double> w;
+        for (const auto& c : candidates) w.push_back(c.server.cpu_capacity);
+        std::discrete_distribution<size_t> pick(w.begin(), w.end());
         return candidates[pick(rng_)].server.server_id;
     }
 

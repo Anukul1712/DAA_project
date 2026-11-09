@@ -40,7 +40,10 @@ REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 IS_WINDOWS = platform.system() == "Windows"
 EXE = ".exe" if IS_WINDOWS else ""
 
-SCHEDULERS = ["heft", "fifo"]
+SCHEDULERS = ["fifo", "heft", "srpt"]
+QUEUES = ["fifo", "priority"]
+SCENARIOS = ["city", "small"]
+WARMUP = {"city": 100.0, "small": 60.0}  # seconds before the first DAG
 POLICIES = ["eft", "least_loaded", "nearest", "ml"]
 WORKLOADS = ["synthetic", "wfcommons"]
 DAG_FILE = os.path.join(REPO_ROOT, "data", "wfcommons_dags.csv")
@@ -102,13 +105,15 @@ def free_port():
 
 # ------------------------------------------------------------------ one run
 
-def run_one(driver, sumo, *, out_prefix, label, scheduler="heft", offloading="eft",
-            workload="synthetic", load=0.4, arrival_rate=None, seed=1, slots=0,
-            warmup=60.0, duration=300.0, drain=120.0, mock=False, gui=False, gui_delay=50,
+def run_one(driver, sumo, *, out_prefix, label, scenario="city", scheduler="fifo", offloading="eft",
+            server_queue="fifo", workload="synthetic", load=0.4, arrival_rate=None, seed=1, slots=0,
+            warmup=100.0, duration=300.0, drain=120.0, mock=False, gui=False, gui_delay=50,
             extra=(), quiet=False):
     """Run iov_sim once (starting and stopping SUMO around it)."""
     os.makedirs(os.path.dirname(os.path.join(REPO_ROOT, out_prefix)), exist_ok=True)
-    args = ["--scheduler", scheduler, "--offloading", offloading, "--workload", workload,
+    args = ["--servers", os.path.join("sumo_scenario", scenario, "servers.csv"),
+            "--scheduler", scheduler, "--offloading", offloading, "--server-queue", server_queue,
+            "--workload", workload,
             "--seed", str(seed), "--server-slots", str(slots), "--warmup", str(warmup),
             "--duration", str(duration), "--drain", str(drain),
             "--out-prefix", out_prefix, "--label", label]
@@ -122,7 +127,7 @@ def run_one(driver, sumo, *, out_prefix, label, scheduler="heft", offloading="ef
 
     for attempt in range(3):  # retry if another process grabbed the port
         port = free_port()
-        sumo_cmd = [sumo, "-c", os.path.join("sumo_scenario", "grid.sumocfg"),
+        sumo_cmd = [sumo, "-c", os.path.join("sumo_scenario", scenario, "grid.sumocfg"),
                     "--remote-port", str(port), "--step-length", "0.1"]
         if gui:
             sumo_cmd += ["--gui-settings-file", os.path.join("sumo_scenario", "gui-settings.xml"),
@@ -176,21 +181,38 @@ def merge_csvs(paths, dest):
 
 # ------------------------------------------------------------------ sweep
 
-def sweep_jobs(loads, seeds, mock):
-    """The two experiments reported in the README (duplicates removed)."""
-    configs = set()
-    # A: offloading benchmark (incl. ML) on both workloads, HEFT-lite order, no admission limit.
-    for wl, pol in itertools.product(WORKLOADS, POLICIES):
-        configs.add((wl, "heft", pol, 0))
-    # B: scheduler comparison, EFT offloading, with and without an admission limit.
-    for wl, sch, slots in itertools.product(WORKLOADS, SCHEDULERS, [0, 5]):
-        configs.add((wl, sch, "eft", slots))
+# Benchmark configurations: (scheduler, offloading, server queue, backlog view).
+#   A. Offloading: FIFO order + FIFO servers; only the server choice changes.
+#   B. Framework ablation: EFT server choice; scheduling and resource allocation change.
+#   C. The ML model inside the proposed framework.
+# QAJS (the proposed framework) = srpt + eft + priority + "all".
+BENCHMARK = [
+    ("fifo", "nearest", "fifo", "all"),
+    ("fifo", "least_loaded", "fifo", "all"),
+    ("fifo", "ml", "fifo", "all"),
+    ("fifo", "eft", "fifo", "all"),
+    ("heft", "eft", "fifo", "all"),
+    ("heft", "eft", "priority", "all"),
+    ("srpt", "eft", "fifo", "all"),
+    ("srpt", "eft", "priority", "ahead"),
+    ("srpt", "eft", "priority", "all"),
+    ("srpt", "ml", "priority", "all"),
+]
+
+
+def config_label(sch, pol, q, view):
+    return f"{sch}_{pol}_{q}" + ("_ahead" if view == "ahead" else "")
+
+
+def sweep_jobs(loads, seeds, mock, scenario):
     jobs = []
-    for (wl, sch, pol, slots), load, seed in itertools.product(sorted(configs), loads, seeds):
-        prefix = os.path.join("results", "sweep", f"{wl}_{sch}_{pol}_k{slots}_u{load:g}_s{seed}")
-        jobs.append(dict(out_prefix=prefix, label=f"{sch}_{pol}", scheduler=sch, offloading=pol,
-                         workload=wl, load=load, seed=seed, slots=slots, mock=mock,
-                         extra=[] if seed == 1 else ["--light"]))  # full logs only for seed 1
+    for (sch, pol, q, view), wl, load, seed in itertools.product(BENCHMARK, WORKLOADS, loads, seeds):
+        label = config_label(sch, pol, q, view)
+        prefix = os.path.join("results", "sweep", f"{wl}_{label}_u{load:g}_s{seed}")
+        extra = ["--backlog-view", view] + ([] if seed == 1 else ["--light"])
+        jobs.append(dict(out_prefix=prefix, label=label, scenario=scenario, scheduler=sch,
+                         offloading=pol, server_queue=q, workload=wl, load=load, seed=seed, mock=mock,
+                         warmup=WARMUP[scenario], extra=extra))
     return jobs
 
 
@@ -198,7 +220,11 @@ def sweep_jobs(loads, seeds, mock):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--scheduler", default="heft", choices=SCHEDULERS)
+    ap.add_argument("--scenario", default="city", choices=SCENARIOS,
+                    help="city: 8x8 grid, 16 servers (default); small: 4x4 grid, 4 servers")
+    ap.add_argument("--scheduler", default="srpt", choices=SCHEDULERS)
+    ap.add_argument("--server-queue", default="priority", choices=QUEUES,
+                    help="how a server picks its next task (default priority)")
     ap.add_argument("--offloading", default="eft", choices=POLICIES + ["random"])
     ap.add_argument("--workload", default="synthetic", choices=WORKLOADS)
     ap.add_argument("--load", type=float, default=0.4,
@@ -207,7 +233,7 @@ def main():
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--server-slots", type=int, default=0,
                     help="max tasks a server holds at once (uploading+queued+running); 0 = unlimited")
-    ap.add_argument("--warmup", type=float, default=60.0)
+    ap.add_argument("--warmup", type=float, default=None, help="default: 100 s (city), 60 s (small)")
     ap.add_argument("--duration", type=float, default=300.0)
     ap.add_argument("--drain", type=float, default=120.0)
     ap.add_argument("--out-prefix", default=os.path.join("results", "run"))
@@ -217,7 +243,7 @@ def main():
     ap.add_argument("--gui-delay", type=int, default=50, help="ms between GUI steps (default 50)")
     ap.add_argument("--driver-bin", default=None, help="path to iov_sim (auto-detected)")
     ap.add_argument("--sweep", action="store_true", help="run every experiment in the README")
-    ap.add_argument("--sweep-loads", default="0.2,0.4,0.6,0.8")
+    ap.add_argument("--sweep-loads", default="0.2,0.4,0.6,0.8,0.9,0.95")
     ap.add_argument("--sweep-seeds", type=int, default=10, help="number of seeds (1..N)")
     ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2),
                     help="parallel runs during --sweep")
@@ -228,21 +254,22 @@ def main():
 
     if not a.sweep:
         check_inputs([a.workload], [a.offloading])
-        label = f"{a.scheduler}_{a.offloading}"
+        label = f"{a.scheduler}_{a.offloading}_{a.server_queue}"
         load_txt = f"{a.arrival_rate} DAG/s" if a.arrival_rate is not None else f"load {a.load}"
-        print(f"Running {label} on the {a.workload} workload at {load_txt}"
+        print(f"Running {label} on the {a.scenario} scenario, {a.workload} workload, {load_txt}"
               + (" (mock mobility)" if a.mock else f" with {os.path.basename(sumo)}"), flush=True)
-        run_one(driver, sumo, out_prefix=a.out_prefix, label=label, scheduler=a.scheduler,
-                offloading=a.offloading, workload=a.workload, load=a.load, arrival_rate=a.arrival_rate,
-                seed=a.seed, slots=a.server_slots, warmup=a.warmup, duration=a.duration, drain=a.drain,
+        run_one(driver, sumo, out_prefix=a.out_prefix, label=label, scenario=a.scenario, scheduler=a.scheduler,
+                offloading=a.offloading, server_queue=a.server_queue, workload=a.workload, load=a.load,
+                arrival_rate=a.arrival_rate, seed=a.seed, slots=a.server_slots,
+                warmup=a.warmup if a.warmup is not None else WARMUP[a.scenario], duration=a.duration, drain=a.drain,
                 mock=a.mock, gui=a.gui, gui_delay=a.gui_delay,
                 extra=["--log-positions"] if a.log_positions else [])
         print(f"Outputs: {a.out_prefix}_*.csv", flush=True)
         return
 
-    check_inputs(WORKLOADS, POLICIES)
+    check_inputs(WORKLOADS, [c[1] for c in BENCHMARK])
     loads = [float(x) for x in a.sweep_loads.split(",")]
-    jobs = sweep_jobs(loads, range(1, a.sweep_seeds + 1), a.mock)
+    jobs = sweep_jobs(loads, range(1, a.sweep_seeds + 1), a.mock, a.scenario)
     sweep_dir = os.path.join(REPO_ROOT, "results", "sweep")
     if os.path.isdir(sweep_dir):
         shutil.rmtree(sweep_dir)

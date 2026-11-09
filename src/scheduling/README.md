@@ -1,35 +1,30 @@
-# Scheduling (task order)
+# Scheduling (task priorities and dispatch order)
 
-Decides **in which order waiting tasks are dispatched**. All tasks whose
-dependencies are finished, from all DAGs, sit in one waiting list; each tick
-the scheduler sorts that list and the driver offers tasks to servers in that
-order.
+All tasks whose dependencies are finished, from all DAGs, wait in one list.
+Each tick the scheduler gives every waiting task a **priority** (lower =
+more urgent) and the driver offers tasks to servers in that order. With
+`--server-queue priority`, servers also use the same priority to choose
+which queued task runs next, which joins scheduling and resource allocation.
 
 | File | What it is |
 |---|---|
 | `task_scheduler.h` | `Task`, `Dag`, `ReadyTask` types and the `ITaskScheduler` interface |
-| `heft_lite_scheduler.h` | **HEFT-lite**: highest *upward rank* first (the prioritisation phase of HEFT) |
-| `fifo_scheduler.h` | **FIFO** baseline: the task that became ready first goes first |
+| `srpt_dag_scheduler.h` | **DAG-SRPT** (ours): the DAG with the least remaining work first; critical path breaks ties |
+| `heft_lite_scheduler.h` | **HEFT-lite**: highest upward rank first (the ordering phase of HEFT) |
+| `fifo_scheduler.h` | **FIFO**: the task that became ready first goes first |
 | `dag_generator.h` | Random DAG generator (synthetic workload) |
-| `workload.h` | `IDagSource`: synthetic DAGs, or real workflow DAGs read from `data/wfcommons_dags.csv` |
+| `workload.h` | `IDagSource`: synthetic DAGs, or real workflow DAGs from `data/wfcommons_dags.csv` |
 
-**Upward rank** of a task = its mean execution time + mean upload time + the
-largest rank among its children. It estimates how long the rest of the DAG
-takes from this task onwards, so the highest rank is on the critical path.
-"Lite" because only HEFT's ordering phase is implemented; picking the server
-is the offloading policy's job (`eft` there is the closest to HEFT's
-server-selection phase).
+**Formulas**
 
-**When does the order matter?** Mostly when tasks have to wait for a
-server. With unlimited admission every waiting task is dispatched in the same
-tick, and the order only sets queue positions; HEFT-lite is then slightly
-faster than FIFO (about 0.3–1%). With an admission limit (`--server-slots K`)
-tasks queue centrally and the order decides who goes first. Under heavy load
-HEFT-lite is then clearly *worse*, because new DAGs keep jumping ahead of
-older ones. See the main README for the numbers.
+- Upward rank: `rank(t) = w_t / f_mean + d_t / r_mean + max over children c of rank(c)`
+- HEFT-lite priority: `-rank(t)`
+- DAG-SRPT priority: `W_g - 1e-6 * rank(t)`, where `W_g` is the total work
+  of the unfinished tasks of the task's DAG `g`
+- FIFO priority: the time the task became ready
 
 **Random DAGs** (`dag_generator.h`): 3–6 tasks; every task after the first
-depends on 1–2 earlier tasks (so the graph is acyclic and topologically
-ordered); workload U(100, 500) Mcycles; input data U(50, 400) KB.
+depends on 1–2 earlier tasks; work U(100, 500) Mcycles; input U(50, 400) KB.
 
-Tests: `tests/run_tests.cpp` (rank values, ordering, generator validity).
+Tests: `tests/run_tests.cpp` (rank values, FIFO order, DAG-SRPT order,
+generator validity).
